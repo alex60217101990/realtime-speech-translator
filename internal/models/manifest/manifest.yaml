@@ -76,3 +76,51 @@ tts:
     json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json
     size_mb: 63
     lang: fr
+
+  piper-pt-BR-faber-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json
+    size_mb: 63
+    lang: pt
+
+  piper-it-IT-paola-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/it/it_IT/paola/medium/it_IT-paola-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/it/it_IT/paola/medium/it_IT-paola-medium.onnx.json
+    size_mb: 63
+    lang: it
+
+  piper-zh-CN-huayan-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json
+    size_mb: 63
+    lang: zh
+
+  piper-uk-UA-ukrainian_tts-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium.onnx.json
+    size_mb: 63
+    lang: uk
+
+  piper-pl-PL-mc_speech-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/pl/pl_PL/mc_speech/medium/pl_PL-mc_speech-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/pl/pl_PL/mc_speech/medium/pl_PL-mc_speech-medium.onnx.json
+    size_mb: 63
+    lang: pl
+
+  piper-nl-NL-mls-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/nl/nl_NL/mls/medium/nl_NL-mls-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/nl/nl_NL/mls/medium/nl_NL-mls-medium.onnx.json
+    size_mb: 63
+    lang: nl
+
+  piper-tr-TR-fahrettin-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fahrettin/medium/tr_TR-fahrettin-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fahrettin/medium/tr_TR-fahrettin-medium.onnx.json
+    size_mb: 63
+    lang: tr
+
+  piper-ja-JP-takumi-medium:
+    onnx_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/ja/ja_JP/takumi/medium/ja_JP-takumi-medium.onnx
+    json_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/ja/ja_JP/takumi/medium/ja_JP-takumi-medium.onnx.json
+    size_mb: 63
+    lang: ja
