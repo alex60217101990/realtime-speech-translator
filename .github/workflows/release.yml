@@ -1,0 +1,129 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version override (default: from tag or 0.0.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # upload release assets
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-universal
+            os: macos-14
+            arch: amd64,arm64
+            script: scripts/package-macos.sh
+            artifacts: |
+              dist/macos/*.dmg
+              dist/macos/RST.app
+          - target: linux-amd64
+            os: ubuntu-22.04
+            arch: amd64
+            script: scripts/package-linux.sh
+            artifacts: |
+              dist/linux/*.AppImage
+              dist/linux/*.deb
+          - target: windows-amd64
+            os: windows-2022
+            arch: amd64
+            script: scripts/package-windows.sh
+            artifacts: |
+              dist/windows/*.exe
+    env:
+      CGO_ENABLED: "1"
+      GOEXPERIMENT: simd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          else
+            v="0.0.0-$(echo ${GITHUB_SHA} | head -c8)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $v"
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev xorg-dev libxkbcommon-dev libasound2-dev libpulse-dev \
+            cmake ninja-build gettext-base
+          # linuxdeploy
+          curl -sLo /tmp/linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x /tmp/linuxdeploy.AppImage
+          sudo mv /tmp/linuxdeploy.AppImage /usr/local/bin/linuxdeploy
+          # nfpm
+          curl -sLo /tmp/nfpm.tgz \
+            https://github.com/goreleaser/nfpm/releases/download/v2.41.3/nfpm_2.41.3_Linux_x86_64.tar.gz
+          tar -xzf /tmp/nfpm.tgz -C /tmp nfpm
+          sudo mv /tmp/nfpm /usr/local/bin/
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install --no-progress --yes nsis
+
+      - name: Build native deps (whisper.cpp / CT2 / SentencePiece)
+        shell: bash
+        run: |
+          ./scripts/build-deps.sh whisper
+          ./scripts/build-deps.sh sentencepiece
+          ./scripts/build-deps.sh ctranslate2
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          # Optional macOS signing — secrets must be configured in repo
+          # settings for release tags. Unsigned builds remain functional.
+          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+          APPLE_NOTARY_PROFILE: ${{ secrets.APPLE_NOTARY_PROFILE }}
+          # Optional Windows code signing.
+          SIGNTOOL_THUMBPRINT: ${{ secrets.SIGNTOOL_THUMBPRINT }}
+        run: ${{ matrix.script }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: warn
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifacts }}
+          generate_release_notes: true
+          draft: true

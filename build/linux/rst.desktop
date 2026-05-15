@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Realtime Speech Translator
+GenericName=Realtime Speech Translator
+Comment=Local realtime speech translation with virtual microphone output
+Exec=translator
+Icon=rst
+Terminal=false
+Categories=AudioVideo;Audio;Accessibility;Utility;
+Keywords=translation;speech;whisper;tts;voice;
+StartupWMClass=translator
+StartupNotify=true

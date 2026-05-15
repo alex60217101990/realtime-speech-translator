@@ -15,7 +15,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            apt: libgl1-mesa-dev xorg-dev libxkbcommon-dev libasound2-dev libpulse-dev
+            apt: libgl1-mesa-dev xorg-dev libxkbcommon-dev libasound2-dev libpulse-dev cmake ninja-build
           - os: macos-14
             apt: ""
           - os: windows-2022
@@ -25,6 +25,8 @@ jobs:
       GOEXPERIMENT: simd
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: actions/setup-go@v5
         with:
@@ -37,11 +39,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
 
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja || true
+
+      - name: Build native deps
+        shell: bash
+        run: |
+          ./scripts/build-deps.sh whisper
+          ./scripts/build-deps.sh sentencepiece
+          ./scripts/build-deps.sh ctranslate2
+
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
       - name: Test
         run: go test -race ./...
 
       - name: Build
-        run: go build -trimpath -ldflags='-s -w' -o bin/translator ./cmd/translator
+        run: make build

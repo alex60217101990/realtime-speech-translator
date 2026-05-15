@@ -92,4 +92,28 @@ tidy:
 	$(GO) mod tidy
 
 clean:
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) dist
+
+# --- packaging ---------------------------------------------------------------
+# Per-OS installer / bundle builds. VERSION is propagated into binary
+# build (-X main.version) and into the Info.plist / NSIS metadata.
+VERSION ?= 0.0.0
+
+.PHONY: package package-macos package-linux package-windows
+
+package:
+	@case "$(UNAME_S)" in \
+		Darwin)  $(MAKE) package-macos ;; \
+		Linux)   $(MAKE) package-linux ;; \
+		MINGW*|MSYS*|CYGWIN*) $(MAKE) package-windows ;; \
+		*)       echo "unsupported host: $(UNAME_S)"; exit 1 ;; \
+	esac
+
+package-macos:
+	VERSION=$(VERSION) ./scripts/package-macos.sh
+
+package-linux:
+	VERSION=$(VERSION) ./scripts/package-linux.sh
+
+package-windows:
+	VERSION=$(VERSION) ./scripts/package-windows.sh

@@ -1,0 +1,43 @@
+# nfpm configuration for building a .deb package.
+# Usage: VERSION=0.1.0 envsubst < build/linux/nfpm.yaml | nfpm pkg --packager deb -f /dev/stdin
+
+name: realtime-speech-translator
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: Aleksandr <alex6021710@gmail.com>
+description: |
+  Local realtime speech translator with virtual microphone output.
+  STT via whisper.cpp, MT via CTranslate2 (MADLAD-400), TTS via Piper.
+  All inference runs on-device — no network calls except first-launch
+  model downloads.
+vendor: Aleksandr
+homepage: https://github.com/alex60217101990/realtime-speech-translator
+license: Apache-2.0
+
+depends:
+  - libc6
+  - libgl1
+  - libxkbcommon0
+  - libxcursor1
+  - libxrandr2
+  - libxinerama1
+  - libxi6
+  - libasound2
+  # PulseAudio/PipeWire-pulse for vmic auto-install + capture
+  - pulseaudio-utils | pipewire-pulse
+
+recommends:
+  - piper-tts
+
+contents:
+  - src: bin/translator
+    dst: /usr/bin/translator
+    file_info:
+      mode: 0755
+  - src: build/linux/rst.desktop
+    dst: /usr/share/applications/rst.desktop
+  - src: build/linux/icons/rst.png
+    dst: /usr/share/icons/hicolor/256x256/apps/rst.png
