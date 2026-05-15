@@ -31,9 +31,16 @@ On first launch:
    (BlackHole on macOS, VB-CABLE on Windows, PulseAudio null-sink on Linux).
    If none is present, a wizard walks you through installing the right one.
 2. Open the **Models** tab and download the default set (Whisper-small,
-   MADLAD-400-3B, a Piper voice for your target language).
+   MADLAD-400-3B, a Piper voice for your target language). Each row in
+   the Models Manager downloads everything that engine needs (e.g. MT
+   rows fetch `model.bin` + `config.json` + `sentencepiece.model` in one
+   shot). All files land in the per-OS data directory.
 3. Pick source and target languages in **Settings**, then press **Start**
    on the **Main** tab. **Cmd/Ctrl + Space** toggles Start/Stop.
+
+The next launch reads everything from the data dir automatically — **no
+CLI flags required** as long as the Models tab has downloaded the matching
+engine. CLI flags exist only for testing / overriding.
 
 ## Key bindings
 

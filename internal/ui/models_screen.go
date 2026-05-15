@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -23,19 +24,29 @@ type modelRow struct {
 	label     string
 	sizeMB    int
 	url       string
-	jsonURL   string // empty for non-TTS
 	sha256    string
 	localPath string
-	jsonLocal string // empty for non-TTS
+	// extras are auxiliary files fetched sequentially after the
+	// primary `url`. Each entry downloads without a checksum (the
+	// upstream HF mirrors do not publish per-file SHA256). Used by MT
+	// rows (config.json + sentencepiece.model) and TTS rows (.onnx.json).
+	extras []extraFile
 }
 
-// installed reports whether the on-disk file exists with non-zero size.
+type extraFile struct {
+	url       string
+	localPath string
+}
+
+// installed reports whether every required file exists on disk.
 func (r modelRow) installed() bool {
 	if !paths.Exists(r.localPath) {
 		return false
 	}
-	if r.jsonLocal != "" && !paths.Exists(r.jsonLocal) {
-		return false
+	for _, e := range r.extras {
+		if !paths.Exists(e.localPath) {
+			return false
+		}
 	}
 	return true
 }
@@ -56,7 +67,20 @@ func gatherRows(m *manifest.File) []modelRow {
 		})
 	}
 	for name, mt := range m.MT {
-		p, _ := paths.MTDir(name)
+		dir, _ := paths.MTDir(name)
+		extras := []extraFile{}
+		if mt.ConfigURL != "" {
+			extras = append(extras, extraFile{
+				url:       mt.ConfigURL,
+				localPath: filepath.Join(dir, "config.json"),
+			})
+		}
+		if mt.TokenizerURL != "" {
+			extras = append(extras, extraFile{
+				url:       mt.TokenizerURL,
+				localPath: filepath.Join(dir, "sentencepiece.model"),
+			})
+		}
 		rows = append(rows, modelRow{
 			id:        name,
 			kind:      "mt",
@@ -64,8 +88,10 @@ func gatherRows(m *manifest.File) []modelRow {
 			sizeMB:    mt.SizeMB,
 			url:       mt.URL,
 			sha256:    mt.SHA256,
-			// model.bin is the canonical "installed" marker
-			localPath: p + string(os.PathSeparator) + "model.bin",
+			// model.bin is the canonical "installed" marker; extras
+			// (config.json, sentencepiece.model) are checked alongside.
+			localPath: filepath.Join(dir, "model.bin"),
+			extras:    extras,
 		})
 	}
 	for name, v := range m.TTS {
@@ -77,18 +103,15 @@ func gatherRows(m *manifest.File) []modelRow {
 			label:     "TTS " + v.Lang + " · " + name,
 			sizeMB:    v.SizeMB,
 			url:       v.ONNXURL,
-			jsonURL:   v.JSONURL,
 			localPath: p,
-			jsonLocal: j,
+			extras:    []extraFile{{url: v.JSONURL, localPath: j}},
 		})
 	}
 	return rows
 }
 
 // ModelsScreen builds a Fyne widget that lists every model in the
-// embedded manifest and lets the user download missing ones. Existing
-// files are flagged with size; downloads run on a background goroutine
-// per row.
+// embedded manifest and lets the user download missing ones.
 func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 	mf, err := manifest.Load()
 	if err != nil {
@@ -118,9 +141,6 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 			progress.Show()
 			go func() {
 				err := downloadRow(context.Background(), dlClient, row, progress, statusLbl)
-				// All widget mutations must happen on the Fyne goroutine
-				// in v2.7+. Bindings are safe; raw widget setters are
-				// not.
 				fyne.Do(func() {
 					if err != nil {
 						statusLbl.SetText("error: " + err.Error())
@@ -173,8 +193,8 @@ func rowStatus(r modelRow) string {
 		return fmt.Sprintf("missing (%d MB)", r.sizeMB)
 	}
 	size := paths.FileSize(r.localPath)
-	if r.jsonLocal != "" {
-		size += paths.FileSize(r.jsonLocal)
+	for _, e := range r.extras {
+		size += paths.FileSize(e.localPath)
 	}
 	return fmt.Sprintf("installed (%d MB)", size>>20)
 }
@@ -193,8 +213,8 @@ func diskUsageSummary(rows []modelRow) string {
 			continue
 		}
 		bytes += paths.FileSize(r.localPath)
-		if r.jsonLocal != "" {
-			bytes += paths.FileSize(r.jsonLocal)
+		for _, e := range r.extras {
+			bytes += paths.FileSize(e.localPath)
 		}
 	}
 	return fmt.Sprintf("Disk usage: %d MB", bytes>>20)
@@ -208,27 +228,26 @@ func downloadRow(ctx context.Context, d *downloader.Downloader, r modelRow, bar 
 	if err != nil {
 		return err
 	}
-	go func() {
-		for p := range ch {
-			updateProgress(bar, status, p)
+	for p := range ch {
+		updateProgress(bar, status, p)
+	}
+	// Fetch closes ch when the goroutine writing to disk finishes; we
+	// can immediately proceed to extras here.
+	for _, e := range r.extras {
+		if e.url == "" || e.localPath == "" {
+			continue
 		}
-	}()
-	if r.jsonURL != "" {
-		// JSON sidecar — small, sequential is fine.
-		time.Sleep(50 * time.Millisecond)
-		jch, err := d.Fetch(ctx, r.jsonURL, r.jsonLocal, "")
+		ech, err := d.Fetch(ctx, e.url, e.localPath, "")
 		if err != nil {
 			return err
 		}
-		for range jch {
+		for p := range ech {
+			updateProgress(bar, status, p)
 		}
 	}
-	// Wait for primary file to fully arrive.
-	for {
-		if paths.Exists(r.localPath) && paths.FileSize(r.localPath) > 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Final sanity check: primary file landed.
+	if !paths.Exists(r.localPath) || paths.FileSize(r.localPath) == 0 {
+		return fmt.Errorf("download finished but %s is missing", r.localPath)
 	}
 	return nil
 }
@@ -249,3 +268,9 @@ func updateProgress(bar *widget.ProgressBar, status *widget.Label, p downloader.
 		}
 	})
 }
+
+// silence unused-import lint when path build tags pluck out time/os.
+var (
+	_ = os.PathSeparator
+	_ = time.Now
+)

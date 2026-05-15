@@ -10,3 +10,4 @@ third_party/build/
 docs/obsidian/.obsidian/
 graphify-out/
 dist/
+/bin/

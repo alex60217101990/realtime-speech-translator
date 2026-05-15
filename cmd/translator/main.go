@@ -37,6 +37,8 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/config"
 	"github.com/alex60217101990/realtime-speech-translator/internal/crashreport"
 	"github.com/alex60217101990/realtime-speech-translator/internal/logging"
+	"github.com/alex60217101990/realtime-speech-translator/internal/models/manifest"
+	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
 	"github.com/alex60217101990/realtime-speech-translator/internal/ui"
@@ -151,12 +153,33 @@ func main() {
 
 	switch *mtBackend {
 	case "madlad":
-		if *mtModelDir != "" && *mtSPModel != "" {
-			eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(*mtModelDir, *mtSPModel))
+		// Resolve MT paths: CLI flags win, otherwise look at the
+		// default MADLAD location populated by the Models tab
+		// downloader.
+		mdir, spm := *mtModelDir, *mtSPModel
+		if mdir == "" || spm == "" {
+			if defaultDir, err := paths.MTDir("madlad-400-3b-int8"); err == nil {
+				if mdir == "" && paths.Exists(filepath.Join(defaultDir, "model.bin")) {
+					mdir = defaultDir
+				}
+				if spm == "" {
+					cand := filepath.Join(defaultDir, "sentencepiece.model")
+					if paths.Exists(cand) {
+						spm = cand
+					}
+				}
+			}
+		}
+		if mdir != "" && spm != "" {
+			eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(mdir, spm))
 			if err != nil {
+				slog.Error("madlad init failed", "err", err)
 				log.Fatalf("madlad: %v", err)
 			}
 			cfg.MTBackend = eng
+			slog.Info("MADLAD loaded", "dir", mdir, "spm", spm)
+		} else {
+			slog.Warn("MT disabled: MADLAD model not present — open the Models tab to download it")
 		}
 	case "opusmt":
 		if *mtOPUSRoot != "" {
@@ -178,9 +201,30 @@ func main() {
 		if err != nil {
 			slog.Warn("tts disabled", "err", err)
 		} else {
-			for lang, path := range voices {
-				if err := peng.AddVoice(piper.Voice{Lang: lang, ONNXPath: path}); err != nil {
+			// 1) explicit --voice flags first
+			for lang, p := range voices {
+				if err := peng.AddVoice(piper.Voice{Lang: lang, ONNXPath: p}); err != nil {
 					slog.Warn("tts voice skipped", "lang", lang, "err", err)
+				}
+			}
+			// 2) auto-discover voices the Models tab dropped into the
+			// per-OS data dir. Filename pattern is the manifest key,
+			// e.g. piper-en-US-amy-medium.onnx.
+			if mf, err := manifest.Load(); err == nil {
+				for name, v := range mf.TTS {
+					if peng.HasVoice(v.Lang) {
+						continue
+					}
+					onnx, _ := paths.TTSVoice(name)
+					json, _ := paths.TTSVoiceJSON(name)
+					if !paths.Exists(onnx) || !paths.Exists(json) {
+						continue
+					}
+					if err := peng.AddVoice(piper.Voice{Lang: v.Lang, ONNXPath: onnx}); err != nil {
+						slog.Warn("auto-loaded tts voice rejected", "name", name, "err", err)
+					} else {
+						slog.Info("auto-loaded tts voice", "lang", v.Lang, "name", name)
+					}
 				}
 			}
 			if peng.HasVoice(cfg.TargetLang) {
@@ -446,18 +490,16 @@ func showVMicWizard(a fyne.App, w fyne.Window) {
 }
 
 // resolveModelPath honours --model first; else config.WhisperModel from
-// saved settings; else falls back to the default cache path.
+// saved settings; else resolves to the platform data dir the Models tab
+// downloader uses (paths.Whisper). This way Models-tab downloads are
+// picked up automatically on the next launch without any CLI flags.
 func resolveModelPath(flagVal, whisperName string) (string, error) {
 	if flagVal != "" {
 		return filepath.Abs(flagVal)
-	}
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
 	}
 	name := whisperName
 	if name == "" {
 		name = "small"
 	}
-	return filepath.Join(cache, "realtime-speech-translator", "models", "whisper", "ggml-"+name+".bin"), nil
+	return paths.Whisper(name)
 }
