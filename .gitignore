@@ -1,0 +1,9 @@
+/bin/
+*.test
+*.out
+*.prof
+*.trace
+.DS_Store
+.vscode/
+.idea/
+third_party/build/
