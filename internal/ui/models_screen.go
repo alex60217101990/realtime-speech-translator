@@ -117,14 +117,20 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 			btn.Disable()
 			progress.Show()
 			go func() {
-				if err := downloadRow(context.Background(), dlClient, row, progress, statusLbl); err != nil {
-					statusLbl.SetText("error: " + err.Error())
-				} else {
-					statusLbl.SetText(rowStatus(row))
-					btn.SetText(rowAction(row))
-				}
-				progress.Hide()
-				btn.Enable()
+				err := downloadRow(context.Background(), dlClient, row, progress, statusLbl)
+				// All widget mutations must happen on the Fyne goroutine
+				// in v2.7+. Bindings are safe; raw widget setters are
+				// not.
+				fyne.Do(func() {
+					if err != nil {
+						statusLbl.SetText("error: " + err.Error())
+					} else {
+						statusLbl.SetText(rowStatus(row))
+						btn.SetText(rowAction(row))
+					}
+					progress.Hide()
+					btn.Enable()
+				})
 			}()
 		})
 
@@ -228,13 +234,18 @@ func downloadRow(ctx context.Context, d *downloader.Downloader, r modelRow, bar 
 }
 
 func updateProgress(bar *widget.ProgressBar, status *widget.Label, p downloader.Progress) {
-	if p.Total > 0 {
-		bar.SetValue(float64(p.Bytes) / float64(p.Total))
-	}
-	mb := p.Bytes >> 20
-	if p.Total > 0 {
-		status.SetText(fmt.Sprintf("downloading: %d / %d MB", mb, p.Total>>20))
-	} else {
-		status.SetText(fmt.Sprintf("downloading: %d MB", mb))
-	}
+	// Widget setters from a background goroutine; wrap so Fyne can
+	// dispatch them on its main loop. The download pump fires several
+	// times per second — fyne.Do is non-blocking and safe here.
+	fyne.Do(func() {
+		if p.Total > 0 {
+			bar.SetValue(float64(p.Bytes) / float64(p.Total))
+		}
+		mb := p.Bytes >> 20
+		if p.Total > 0 {
+			status.SetText(fmt.Sprintf("downloading: %d / %d MB", mb, p.Total>>20))
+		} else {
+			status.SetText(fmt.Sprintf("downloading: %d MB", mb))
+		}
+	})
 }

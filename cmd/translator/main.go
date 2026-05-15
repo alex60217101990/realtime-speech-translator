@@ -19,8 +19,10 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -94,6 +96,18 @@ func main() {
 			slog.Error("crash report written", "path", path)
 		},
 	)
+
+	// Fyne on macOS intercepts SIGINT and just hides the window. We
+	// want Ctrl+C in the parent terminal to actually quit, so install
+	// our own handler that os.Exit()s the process before Fyne sees
+	// the signal.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-sigCh
+		slog.Info("signal received, exiting", "signal", s.String())
+		os.Exit(0)
+	}()
 
 	saved, err := config.Load()
 	if err != nil {
@@ -242,15 +256,17 @@ func main() {
 	var startBtn *widget.Button
 	toggleSession := func() {
 		switch sess.State() {
-		case rstapp.StateIdle:
+		case rstapp.StateIdle, rstapp.StateError:
 			if err := sess.Start(); err != nil {
-				_ = statusBind.Set("Status: error: " + err.Error())
+				slog.Error("session start failed", "err", err)
+				dialog.ShowError(err, w)
 				return
 			}
 			startBtn.SetText("Stop")
 		case rstapp.StateRunning:
 			if err := sess.Stop(); err != nil {
-				_ = statusBind.Set("Status: error: " + err.Error())
+				slog.Error("session stop failed", "err", err)
+				dialog.ShowError(err, w)
 				return
 			}
 			startBtn.SetText("Start")
@@ -281,7 +297,20 @@ func main() {
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
-			_ = statusBind.Set("Status: " + sess.State().String())
+			state := sess.State()
+			seconds := float64(sess.CapturedSamples()) / 16000.0
+			peak := sess.PeakAbs()
+			level := float64(peak) / 32768.0 // 0..1
+			sess.PeakAbsReset()
+			total, active, utts, drops := sess.VADStats()
+			activePct := 0.0
+			if total > 0 {
+				activePct = 100 * float64(active) / float64(total)
+			}
+			_ = statusBind.Set(fmt.Sprintf(
+				"Status: %s   Captured: %.1fs   Mic: %3.0f%%   VAD active: %.0f%%   Utts: %d (drop %d)",
+				state.String(), seconds, level*100, activePct, utts, drops,
+			))
 		}
 	}()
 

@@ -139,6 +139,21 @@ make bench         # microbenchmarks
 VERSION=0.1.0 make package
 ```
 
+### GPU acceleration (Apple Silicon)
+
+The default build is **CPU + BLAS only** because older Intel-mac AMD GPUs
+break ggml-metal's matrix-multiply path and produce garbage transcripts.
+Apple Silicon users can re-enable Metal:
+
+```bash
+rm -rf third_party/whisper.cpp/build_go
+GGML_METAL=ON ./scripts/build-deps.sh whisper
+make build
+```
+
+Verify the active backend in `translator.log` at startup — look for either
+`using BLAS backend` (CPU default) or `using Metal backend` (GPU enabled).
+
 CI runs the same scripts on every push. Tagged releases (`v*`) produce a
 draft GitHub Release with macOS `.dmg`, Linux `.AppImage` + `.deb`, and a
 Windows NSIS installer attached.

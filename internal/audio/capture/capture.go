@@ -36,6 +36,8 @@ type Source struct {
 	sink    Sink
 	running atomic.Bool
 	dropped atomic.Uint64
+	frames  atomic.Uint64 // cumulative sample count actually received
+	peakAbs atomic.Int32  // max |int16| seen since last reset
 }
 
 // New constructs but does not start a capture Source. The given context
@@ -87,6 +89,22 @@ func (s *Source) onFrames(_, pSample []byte, framecount uint32) {
 	n := int(framecount)
 	hdr := unsafe.SliceData(pSample)
 	samples := unsafe.Slice((*int16)(unsafe.Pointer(hdr)), n)
+	// Cheap audio-thread instrumentation: cumulative samples + peak
+	// abs amplitude. Peak is computed inline; min/sum would cost more
+	// arithmetic than we want here.
+	s.frames.Add(uint64(n))
+	var peak int16
+	for _, v := range samples {
+		if v < 0 {
+			v = -v
+		}
+		if v > peak {
+			peak = v
+		}
+	}
+	if int32(peak) > s.peakAbs.Load() {
+		s.peakAbs.Store(int32(peak))
+	}
 	s.sink.WriteSamples(samples)
 }
 
@@ -130,6 +148,18 @@ func (s *Source) Close() error {
 // Reads-only counter; Sink implementations are responsible for updating it
 // via WithDropCounter wrappers if they want the metric surfaced.
 func (s *Source) DroppedFrames() uint64 { return s.dropped.Load() }
+
+// CapturedSamples returns the cumulative number of samples received
+// from the device. Stays 0 if the audio callback never fires.
+func (s *Source) CapturedSamples() uint64 { return s.frames.Load() }
+
+// PeakAbs returns the maximum |int16| seen since the last PeakAbsReset.
+// Use it as a "is anyone speaking" indicator; 0 = silence / dead mic.
+func (s *Source) PeakAbs() int16 { return int16(s.peakAbs.Load()) }
+
+// PeakAbsReset zeroes the peak counter so the next sample window starts
+// fresh.
+func (s *Source) PeakAbsReset() { s.peakAbs.Store(0) }
 
 // AddDropped is exposed for Sink wrappers that wish to report overflow
 // back to the Source for metrics aggregation.

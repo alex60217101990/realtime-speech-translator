@@ -13,12 +13,21 @@ LDFLAGS      := -s -w
 UNAME_S      := $(shell uname -s)
 
 # --- whisper.cpp env wiring -------------------------------------------------
+# The ggml-metal subdir is included in LIBRARY_PATH on Darwin regardless
+# of whether Metal was actually compiled — build-deps.sh drops an empty
+# libggml-metal.a stub there so the upstream cgo binding (which hardcodes
+# `-lggml-metal`) still links. Apple Silicon users who opt into Metal
+# with GGML_METAL=ON get a real lib in the same place.
 WHISPER_DIR  := $(abspath third_party/whisper.cpp)
 WHISPER_BUILD:= $(WHISPER_DIR)/build_go
 WHISPER_INC  := $(WHISPER_DIR)/include:$(WHISPER_DIR)/ggml/include
 WHISPER_LIB  := $(WHISPER_BUILD)/src:$(WHISPER_BUILD)/ggml/src
 ifeq ($(UNAME_S),Darwin)
 WHISPER_LIB  := $(WHISPER_LIB):$(WHISPER_BUILD)/ggml/src/ggml-blas:$(WHISPER_BUILD)/ggml/src/ggml-metal
+# GGML_METAL_PATH_RESOURCES points the ggml-metal runtime at the
+# Metal source tree so it can compile shaders on the fly. Harmless
+# when Metal is off (no caller looks at the env), useful when the
+# user opts back in with GGML_METAL=ON.
 export GGML_METAL_PATH_RESOURCES := $(WHISPER_DIR)
 endif
 

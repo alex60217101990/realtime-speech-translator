@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -90,6 +91,13 @@ type Segmenter struct {
 
 	out chan Utterance
 	mu  sync.Mutex // serialises WriteFrame calls
+
+	// instrumentation surfaced to the UI / logs so it is obvious
+	// whether VAD is firing at all.
+	activeFrames atomic.Uint64
+	totalFrames  atomic.Uint64
+	utterances   atomic.Uint64
+	drops        atomic.Uint64
 }
 
 // New constructs a Segmenter. The Output channel is buffered (cap=4) so
@@ -148,6 +156,10 @@ func (s *Segmenter) processFrame(frame []int16) {
 		// A malformed frame is non-fatal for the stream; skip it.
 		return
 	}
+	s.totalFrames.Add(1)
+	if active {
+		s.activeFrames.Add(1)
+	}
 
 	if !s.speaking {
 		// Roll the pre-pad ring with this silence frame so that, on
@@ -204,9 +216,11 @@ func (s *Segmenter) processFrame(frame []int16) {
 		}
 		select {
 		case s.out <- ut:
+			s.utterances.Add(1)
 		default:
 			// Consumer is behind; drop this utterance rather than
 			// blocking the audio thread.
+			s.drops.Add(1)
 		}
 	}
 	s.speaking = false
@@ -214,6 +228,27 @@ func (s *Segmenter) processFrame(frame []int16) {
 	s.speechMs = 0
 	s.curr = s.curr[:0]
 	s.prePadN = 0
+}
+
+// Stats returns lightweight counters useful for diagnostics:
+// total frames analysed, frames that VAD classified as active speech,
+// finished utterances emitted on Output, and utterances dropped
+// because the consumer was full.
+type Stats struct {
+	TotalFrames  uint64
+	ActiveFrames uint64
+	Utterances   uint64
+	Drops        uint64
+}
+
+// Stats snapshot for the UI status line.
+func (s *Segmenter) Stats() Stats {
+	return Stats{
+		TotalFrames:  s.totalFrames.Load(),
+		ActiveFrames: s.activeFrames.Load(),
+		Utterances:   s.utterances.Load(),
+		Drops:        s.drops.Load(),
+	}
 }
 
 // Close releases the WebRTC VAD context and closes the output channel.

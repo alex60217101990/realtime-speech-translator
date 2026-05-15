@@ -121,7 +121,12 @@ func New(cfg Config) (*Session, error) {
 	s := &Session{cfg: cfg, mctx: mctx}
 
 	pcfg := cfg.PipelineConf
-	if pcfg.Engine.Language == "" {
+	// Session.Config.SourceLang is the user-visible source language;
+	// it overrides whatever DefaultConfig stamped into the pipeline.
+	// Without this, --src ru leaks back to "auto" because the pipeline
+	// default is "auto" (non-empty), so an `== ""` guard would let it
+	// through.
+	if cfg.SourceLang != "" {
 		pcfg.Engine.Language = cfg.SourceLang
 	}
 	if cfg.MTBackend != nil && cfg.TargetLang != "" {
@@ -190,35 +195,48 @@ func (s *Session) State() State { return State(s.state.Load()) }
 
 // Start activates the capture device, the STT pipeline and (if
 // configured) the playback device for TTS output.
+//
+// On failure all subsystems are rolled back and the state is reset to
+// Idle so the caller can retry once the underlying problem (e.g. mic
+// permission) is fixed. The returned error is wrapped with the stage
+// name so the UI can show "capture start (mic permission?): …".
 func (s *Session) Start() error {
-	if !s.state.CompareAndSwap(int32(StateIdle), int32(StateStarting)) {
-		return fmt.Errorf("app: cannot start from state %s", State(s.state.Load()))
+	cur := State(s.state.Load())
+	if cur != StateIdle && cur != StateError {
+		return fmt.Errorf("app: cannot start from state %s", cur)
+	}
+	if !s.state.CompareAndSwap(int32(cur), int32(StateStarting)) {
+		return fmt.Errorf("app: state changed before start (now %s)", State(s.state.Load()))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	if err := s.pipeline.Start(ctx); err != nil {
 		cancel()
-		s.state.Store(int32(StateError))
-		return err
+		s.state.Store(int32(StateIdle))
+		return fmt.Errorf("pipeline start: %w", err)
 	}
 	if s.playbackD != nil {
 		if err := s.playbackD.Start(); err != nil {
 			cancel()
-			s.state.Store(int32(StateError))
-			return err
+			s.state.Store(int32(StateIdle))
+			return fmt.Errorf("playback start: %w", err)
 		}
 	}
 	if err := s.cap.Start(); err != nil {
 		_ = s.stopPlayback()
 		cancel()
-		s.state.Store(int32(StateError))
-		return err
+		s.state.Store(int32(StateIdle))
+		return fmt.Errorf("capture start (mic permission?): %w", err)
 	}
 	s.state.Store(int32(StateRunning))
 	return nil
 }
 
 // Stop halts the audio devices and the pipeline. Idempotent.
+//
+// Blocks until the Pipeline's run goroutine has actually exited; the
+// next Start call sees running=false and can launch a fresh goroutine
+// without racing.
 func (s *Session) Stop() error {
 	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
 		return nil
@@ -233,6 +251,9 @@ func (s *Session) Stop() error {
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
+	}
+	if s.pipeline != nil {
+		s.pipeline.Stop()
 	}
 	if s.playbackR != nil {
 		s.playbackR.Reset()
@@ -288,6 +309,44 @@ func (s *Session) CaptureHealth() capture.HealthReport {
 		return capture.HealthReport{}
 	}
 	return s.cap.Health()
+}
+
+// CapturedSamples returns the cumulative sample count the audio
+// callback has delivered. Surfaced in the UI stats line so a stuck
+// device is visible at a glance.
+func (s *Session) CapturedSamples() uint64 {
+	if s.cap == nil {
+		return 0
+	}
+	return s.cap.CapturedSamples()
+}
+
+// PeakAbs returns the current peak |int16| amplitude observed since
+// the previous PeakAbsReset. 0 = silence, ~32760 = clipping.
+func (s *Session) PeakAbs() int16 {
+	if s.cap == nil {
+		return 0
+	}
+	return s.cap.PeakAbs()
+}
+
+// PeakAbsReset is called by the UI ticker so each refresh window shows
+// the peak for just that window, not since session start.
+func (s *Session) PeakAbsReset() {
+	if s.cap != nil {
+		s.cap.PeakAbsReset()
+	}
+}
+
+// VADStats forwards segmenter counters: (totalFrames, activeFrames,
+// utterancesEmitted, utterancesDropped). All zero when no Pipeline
+// exists yet.
+func (s *Session) VADStats() (total, active, utterances, drops uint64) {
+	if s.pipeline == nil {
+		return 0, 0, 0, 0
+	}
+	st := s.pipeline.VADStats()
+	return st.TotalFrames, st.ActiveFrames, st.Utterances, st.Drops
 }
 
 // PlaybackUnderruns reports samples the TTS playback device had to fill

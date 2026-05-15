@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -141,21 +142,35 @@ func New(modelPath string, cfg Config) (*Pipeline, error) {
 // stopped via Close.
 func (p *Pipeline) Output() <-chan Event { return p.out }
 
+// VADStats exposes the segmenter counters so the UI can render a live
+// "VAD is firing" indicator without poking the internal segmenter.
+func (p *Pipeline) VADStats() vad.Stats { return p.seg.Stats() }
+
 // WriteFrame forwards int16 mono PCM into the VAD segmenter. Safe to
 // call from a single producer goroutine.
 func (p *Pipeline) WriteFrame(samples []int16) { p.seg.WriteFrame(samples) }
 
-// Start launches the recognition goroutine. Calling Start twice without
-// an intervening Close returns an error.
+// Start launches the recognition goroutine. If a previous Start is
+// still winding down (the Whisper cgo call has not returned yet) we
+// wait up to startWaitTimeout for it to exit, then proceed. This makes
+// Session.Stop → Session.Start work reliably even when the GPU is
+// slow.
 func (p *Pipeline) Start(ctx context.Context) error {
-	p.mu.Lock()
-	if p.running {
+	const startWaitTimeout = 5 * time.Second
+	deadline := time.Now().Add(startWaitTimeout)
+	for {
+		p.mu.Lock()
+		if !p.running {
+			p.running = true
+			p.mu.Unlock()
+			break
+		}
 		p.mu.Unlock()
-		return errors.New("stt: already running")
+		if time.Now().After(deadline) {
+			return errors.New("stt: previous run still active after 5 s — try again")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	p.running = true
-	p.mu.Unlock()
-
 	p.wg.Add(1)
 	go p.run(ctx)
 	return nil
@@ -164,7 +179,17 @@ func (p *Pipeline) Start(ctx context.Context) error {
 func (p *Pipeline) run(ctx context.Context) {
 	p.ctx = ctx
 	defer p.wg.Done()
-	defer close(p.out)
+	// Mark not-running on exit so the Pipeline can be Start()ed again
+	// in the same lifetime (Session.Stop → Session.Start without
+	// throwing away the Whisper context). We deliberately do NOT close
+	// p.out here — Close does that exactly once when the Session is
+	// torn down. Keeping out open lets the UI consumer goroutine
+	// survive Stop/Start cycles.
+	defer func() {
+		p.mu.Lock()
+		p.running = false
+		p.mu.Unlock()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -180,6 +205,40 @@ func (p *Pipeline) run(ctx context.Context) {
 	}
 }
 
+// Stop signals the run goroutine to exit without waiting for it.
+//
+// Why non-blocking: Whisper.Transcribe is a synchronous cgo call that
+// does not honour context cancellation, so a wg.Wait could hang for
+// the full duration of an in-flight inference (multiple seconds on a
+// slow GPU). The trade-off: a follow-up Start may briefly see
+// running=true and refuse; the caller should retry. WaitStopped is
+// available for the slow path that genuinely needs to block.
+func (p *Pipeline) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// running is reset in run()'s defer; nothing to flip here. The
+	// outer ctx (passed to Start) is what actually halts the loop —
+	// Session.Stop cancels it.
+}
+
+// WaitStopped blocks until the previously-started run goroutine has
+// fully exited or the timeout elapses. Returns true if the goroutine
+// is gone, false on timeout. Useful for tests; production code should
+// not need to block.
+func (p *Pipeline) WaitStopped(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	override := p.cfg.Engine
 	p.mu.Lock()
@@ -192,11 +251,20 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	if err != nil {
 		// Stay alive — a single bad utterance shouldn't tear the
 		// pipeline down. The UI can surface error counters separately.
+		slog.Warn("whisper transcribe failed", "err", err)
 		return
 	}
 
+	slog.Info("whisper transcribed",
+		"raw", tr.Text,
+		"lang", tr.Language,
+		"pcm_samples", len(ut.PCM),
+		"duration", ut.Duration,
+		"latency", tr.Latency,
+	)
 	text := normalize(tr.Text)
 	if text == "" {
+		slog.Debug("transcript empty after normalize", "raw", tr.Text)
 		return
 	}
 
@@ -260,23 +328,40 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 }
 
 // Close stops the goroutine, the segmenter and the Whisper engine.
-// Output channel is closed before Close returns.
+// Output channel is closed before Close returns. After Close, Start
+// returns an error — use a fresh Pipeline for the next session.
 func (p *Pipeline) Close() error {
 	p.mu.Lock()
-	if !p.running {
-		p.mu.Unlock()
-		return nil
-	}
+	wasRunning := p.running
 	p.running = false
 	p.mu.Unlock()
 
-	close(p.done)
+	if wasRunning {
+		// done may have been closed already by a previous Close (no-op
+		// in that case is harmless because we only Close once per
+		// Pipeline lifetime).
+		select {
+		case <-p.done:
+		default:
+			close(p.done)
+		}
+	}
 	_ = p.seg.Close()
 	p.wg.Wait()
+	// Close the event channel exactly once. After Close the UI
+	// consumer's `for range pipeline.Output()` loop terminates. The
+	// recover guards against a double-Close from buggy callers.
+	safeClose(p.out)
 	if err := p.engine.Close(); err != nil {
 		return fmt.Errorf("stt: close engine: %w", err)
 	}
 	return nil
+}
+
+// safeClose protects against double-close panics on the event channel.
+func safeClose(ch chan Event) {
+	defer func() { _ = recover() }()
+	close(ch)
 }
 
 // normalize trims surrounding whitespace from Whisper output and drops

@@ -9,9 +9,13 @@
 #   scripts/build-deps.sh whisper   # build only whisper.cpp
 #
 # Environment overrides:
-#   JOBS        parallel build jobs (default: number of CPUs)
-#   CMAKE       cmake binary (default: cmake)
-#   GGML_METAL  ON|OFF, default ON on Darwin
+#   JOBS              parallel build jobs (default: number of CPUs)
+#   CMAKE             cmake binary (default: cmake)
+#   GGML_METAL        ON|OFF, default OFF everywhere. Apple Silicon
+#                     users can opt in with GGML_METAL=ON. Older Intel
+#                     macs with AMD GPUs MUST stay OFF.
+#   WHISPER_METAL_OFF deprecated alias for GGML_METAL=OFF; kept for
+#                     backward compatibility with earlier docs.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,7 +28,13 @@ if ! command -v "$CMAKE" >/dev/null 2>&1; then
 fi
 
 case "$(uname -s)" in
-  Darwin)  : "${GGML_METAL:=ON}"  ;;
+  # Default Metal OFF on Darwin: old Intel-mac GPUs (e.g. AMD Radeon
+  # Pro 5300M) lack simdgroup matrix-multiply and ggml-metal returns
+  # garbage / fails to find its embedded .metallib at runtime when the
+  # binary is invoked outside the source tree. CPU + BLAS works
+  # everywhere. Set GGML_METAL=ON explicitly to opt back in on
+  # supported hardware (Apple Silicon).
+  Darwin)  : "${GGML_METAL:=OFF}" ;;
   *)       : "${GGML_METAL:=OFF}" ;;
 esac
 
@@ -36,15 +46,39 @@ build_whisper() {
     exit 1
   fi
 
+  # WHISPER_METAL_OFF=1 forces CPU-only ggml on macOS for hosts where
+  # the Metal backend on older AMD GPUs returns garbage / hangs.
+  local metal_flag="$GGML_METAL"
+  if [ "${WHISPER_METAL_OFF:-0}" = "1" ]; then
+    metal_flag="OFF"
+  fi
+
   "$CMAKE" -S "$src" -B "$build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF \
     -DWHISPER_BUILD_EXAMPLES=OFF \
     -DWHISPER_BUILD_TESTS=OFF \
     -DWHISPER_BUILD_SERVER=OFF \
-    -DGGML_METAL="$GGML_METAL"
+    -DGGML_METAL="$metal_flag"
 
   "$CMAKE" --build "$build" --target whisper --parallel "$JOBS"
+
+  # The upstream Go binding hardcodes `-lggml-metal` in cgo LDFLAGS.
+  # When Metal is disabled the lib is never built and the linker
+  # errors out. Drop an empty stub archive at the expected path so
+  # the cgo link still resolves without bringing Metal symbols in.
+  if [ "$metal_flag" = "OFF" ]; then
+    local stub_dir="$build/ggml/src/ggml-metal"
+    mkdir -p "$stub_dir"
+    if [ ! -f "$stub_dir/libggml-metal.a" ]; then
+      local empty_obj="$stub_dir/empty.o"
+      printf '' > "$stub_dir/empty.c"
+      cc -c -x c "$stub_dir/empty.c" -o "$empty_obj"
+      ar rcs "$stub_dir/libggml-metal.a" "$empty_obj"
+      rm -f "$empty_obj" "$stub_dir/empty.c"
+      echo "build-deps: produced stub $stub_dir/libggml-metal.a"
+    fi
+  fi
 }
 
 build_sentencepiece() {
