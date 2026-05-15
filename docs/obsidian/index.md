@@ -26,6 +26,7 @@ cssclasses:
 - [[architecture/UI Polish M5]] — M5 AppTabs, Models Manager, Settings, hotkey, themes
 - [[architecture/Packaging M6]] — M6 macOS .app/.dmg, Linux AppImage/.deb, Windows NSIS, CI matrix
 - [[architecture/Beta Polish M7]] — M7 logging, crash reporter, BT HFP warning, README/LICENSE
+- [[architecture/v1.0 M8]] — M8 CHANGELOG, bench harness, v1.0 wrap-up
 - [[architecture/Goroutine Model]] — channels, backpressure, OS-thread locking
 - [[architecture/Cgo Boundary]] — where cgo lives, why, build implications
 
@@ -75,10 +76,10 @@ cssclasses:
 
 ## Project state
 
-- **Current milestone:** M2 — STT integration ([[../wiki/08-Roadmap|roadmap]])
+- **Current state:** v1.0 ready ([[architecture/v1.0 M8]], [[../../CHANGELOG.md|CHANGELOG]])
 - **Go:** 1.26 (`go.mod`)
 - **Platforms:** macOS, Linux, Windows (desktop)
-- **Build root:** [[../../Makefile|Makefile]] — `make build`, `make test-race`, `make bench`
+- **Build root:** [[../../Makefile|Makefile]] — `make build`, `make test-race`, `make bench`, `make package`
 
 ## Recent log
 
@@ -90,3 +91,4 @@ cssclasses:
 - 2026-05-15 — M5 done: AppTabs (Main / Models / Settings), persistent [[../../internal/config/config.go|internal/config]] YAML in XDG/AppData, [[architecture/UI Polish M5|Models Manager]] downloads manifest entries with progress bars, Settings form bound to config (theme live-applied), Cmd/Ctrl+Space hotkey toggles Start/Stop. Manifest grew to 13 Piper voices (added pt/it/zh/uk/pl/nl/tr/ja).
 - 2026-05-15 — M6 done: per-OS packaging scripts ([[../../scripts/package-macos.sh|macOS]] universal .dmg, [[../../scripts/package-linux.sh|Linux]] AppImage + .deb via nfpm, [[../../scripts/package-windows.sh|Windows]] NSIS); [[../../.github/workflows/release.yml|release.yml]] matrix on `v*` tags publishes a draft GitHub Release; build.yml now also builds native deps on every push.
 - 2026-05-15 — M7 done: [[../../internal/logging/logging.go|structured slog]] with JSON file rotation + text stderr; [[../../internal/crashreport/crashreport.go|crash reporter]] writes local `.txt` reports and re-throws; [[architecture/Beta Polish M7|capture.Health]] surfaces Bluetooth HFP degradation in the UI; README + LICENSE landed.
+- 2026-05-15 — **v1.0 ready**: [[../../CHANGELOG.md|CHANGELOG]] published; [[../../cmd/bench/main.go|cmd/bench]] offline latency harness drives the pipeline without audio devices and reports p50/p95/p99 per stage. Both `translator` and `bench` built by `make build`.

@@ -72,6 +72,7 @@ deps-ctranslate2:
 # --- Go ---------------------------------------------------------------------
 build: | $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/translator
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/bench ./cmd/bench
 
 run: build
 	./$(BIN)
