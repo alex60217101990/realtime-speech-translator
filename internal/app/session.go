@@ -1,10 +1,10 @@
 // Package app provides the high-level composition root for the
 // realtime-speech-translator daemon.
 //
-// M1 implemented the audio loopback. M2 adds VAD + Whisper: the capture
-// stream is forwarded into the STT pipeline, which emits Transcript
-// events on a channel consumed by the UI. The playback device is not
-// opened in M2 — TTS-driven playback returns in M3.
+// M3b assembles the full audio loop: capture → VAD → Whisper → MT →
+// Piper TTS → playback. The TTS branch is optional; without it the
+// Session emits transcript+translation events only and never opens a
+// playback device.
 package app
 
 import (
@@ -16,12 +16,13 @@ import (
 	"github.com/gen2brain/malgo"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/capture"
+	"github.com/alex60217101990/realtime-speech-translator/internal/audio/playback"
+	"github.com/alex60217101990/realtime-speech-translator/internal/audio/ringbuf"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 )
 
-// State enumerates the user-visible session states. Stored atomically so
-// UI goroutines can poll without locking.
+// State enumerates the user-visible session states.
 type State int32
 
 const (
@@ -50,38 +51,49 @@ func (s State) String() string {
 
 // Config bundles runtime parameters for a Session.
 type Config struct {
-	SampleRate   uint32
+	SampleRate   uint32 // capture rate; Whisper requires 16 kHz
 	ModelPath    string
 	SourceLang   string // ISO-639-1 or "auto"
 	TargetLang   string // ISO-639-1, empty disables MT
 	MTBackend    mt.Engine
-	PipelineConf stt.Config
+	TTSBackend   stt.TTSEngine
+	// TTSRate is the playback rate for TTS audio; Piper emits 22050 Hz.
+	TTSRate uint32
+	// PlaybackBufferSamples sizes the ringbuf between TTS and the
+	// audio device. Must be a power of two. Zero defaults to 65536
+	// (~3 s at 22050 Hz) which absorbs Piper's bursty output.
+	PlaybackBufferSamples int
+	PipelineConf          stt.Config
 }
 
-// DefaultConfig returns a Config tuned for 16 kHz Whisper input.
+// DefaultConfig returns a Config tuned for 16 kHz Whisper input and
+// 22050 Hz Piper output.
 func DefaultConfig() Config {
 	return Config{
-		SampleRate:   16000,
-		SourceLang:   "auto",
-		PipelineConf: stt.DefaultConfig(),
+		SampleRate:            16000,
+		SourceLang:            "auto",
+		TTSRate:               22050,
+		PlaybackBufferSamples: 65536,
+		PipelineConf:          stt.DefaultConfig(),
 	}
 }
 
-// Session owns the audio capture device and the STT pipeline.
+// Session owns the audio devices and the STT/MT/TTS pipeline.
 type Session struct {
 	cfg   Config
 	state atomic.Int32
 	drops atomic.Uint64
 
-	mctx     *malgo.AllocatedContext
-	cap      *capture.Source
-	pipeline *stt.Pipeline
-	cancel   context.CancelFunc
+	mctx      *malgo.AllocatedContext
+	cap       *capture.Source
+	pipeline  *stt.Pipeline
+	playbackD *playback.Sink
+	playbackR *ringbuf.Ring
+	cancel    context.CancelFunc
 }
 
-// New constructs a Session with the audio device and STT pipeline
-// initialised but not yet running. ModelPath must point at a Whisper
-// ggml-format model file.
+// New constructs a Session with the audio devices and STT pipeline
+// initialised but not yet running.
 func New(cfg Config) (*Session, error) {
 	if cfg.SampleRate == 0 {
 		return nil, errors.New("app: SampleRate must be set")
@@ -89,6 +101,20 @@ func New(cfg Config) (*Session, error) {
 	if cfg.ModelPath == "" {
 		return nil, errors.New("app: ModelPath must be set")
 	}
+	if cfg.TTSBackend != nil {
+		if cfg.TTSRate == 0 {
+			return nil, errors.New("app: TTSRate must be set when TTSBackend is configured")
+		}
+		if cfg.PlaybackBufferSamples <= 0 {
+			cfg.PlaybackBufferSamples = 65536
+		}
+	}
+
+	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("app: init miniaudio context: %w", err)
+	}
+	s := &Session{cfg: cfg, mctx: mctx}
 
 	pcfg := cfg.PipelineConf
 	if pcfg.Engine.Language == "" {
@@ -98,41 +124,65 @@ func New(cfg Config) (*Session, error) {
 		pcfg.MT = mt.Serial(cfg.MTBackend)
 		pcfg.TargetLang = cfg.TargetLang
 	}
+
+	// Wire optional TTS + playback. The pipeline writes synthesised
+	// PCM through pcfg.Audio (an AudioSink that pushes into our
+	// playback ringbuf). The playback device drains that same ring.
+	if cfg.TTSBackend != nil {
+		rb, err := ringbuf.New(cfg.PlaybackBufferSamples)
+		if err != nil {
+			_ = mctx.Uninit()
+			mctx.Free()
+			return nil, fmt.Errorf("app: playback ringbuf: %w", err)
+		}
+		s.playbackR = rb
+		pcfg.TTS = cfg.TTSBackend
+		pcfg.Audio = &playbackSink{rb: rb}
+	}
+
 	pipeline, err := stt.New(cfg.ModelPath, pcfg)
 	if err != nil {
+		_ = mctx.Uninit()
+		mctx.Free()
 		return nil, fmt.Errorf("app: stt pipeline: %w", err)
 	}
-
-	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
-	if err != nil {
-		_ = pipeline.Close()
-		return nil, fmt.Errorf("app: init miniaudio context: %w", err)
-	}
-
-	s := &Session{cfg: cfg, mctx: mctx, pipeline: pipeline}
+	s.pipeline = pipeline
 
 	cap, err := capture.New(mctx, capture.Config{SampleRate: cfg.SampleRate}, &sttSink{
 		pipeline: pipeline,
 		drops:    &s.drops,
 	})
 	if err != nil {
+		_ = pipeline.Close()
 		_ = mctx.Uninit()
 		mctx.Free()
-		_ = pipeline.Close()
 		return nil, err
 	}
 	s.cap = cap
+
+	if cfg.TTSBackend != nil {
+		pb, err := playback.New(mctx, playback.Config{SampleRate: cfg.TTSRate}, &playbackSource{rb: s.playbackR})
+		if err != nil {
+			_ = cap.Close()
+			_ = pipeline.Close()
+			_ = mctx.Uninit()
+			mctx.Free()
+			return nil, fmt.Errorf("app: playback device: %w", err)
+		}
+		s.playbackD = pb
+	}
+
 	return s, nil
 }
 
-// Events returns the channel that emits recognised utterances. It is
-// closed by Close.
+// Events returns the channel that emits recognised utterances.
 func (s *Session) Events() <-chan stt.Event { return s.pipeline.Output() }
 
 // State returns the current session state.
 func (s *Session) State() State { return State(s.state.Load()) }
 
-// Start activates the capture device and the STT pipeline.
+// Start activates the capture device, the STT pipeline and (if
+// configured) the playback device for TTS output.
 func (s *Session) Start() error {
 	if !s.state.CompareAndSwap(int32(StateIdle), int32(StateStarting)) {
 		return fmt.Errorf("app: cannot start from state %s", State(s.state.Load()))
@@ -144,7 +194,15 @@ func (s *Session) Start() error {
 		s.state.Store(int32(StateError))
 		return err
 	}
+	if s.playbackD != nil {
+		if err := s.playbackD.Start(); err != nil {
+			cancel()
+			s.state.Store(int32(StateError))
+			return err
+		}
+	}
 	if err := s.cap.Start(); err != nil {
+		_ = s.stopPlayback()
 		cancel()
 		s.state.Store(int32(StateError))
 		return err
@@ -153,7 +211,7 @@ func (s *Session) Start() error {
 	return nil
 }
 
-// Stop halts the audio device and the pipeline. Idempotent.
+// Stop halts the audio devices and the pipeline. Idempotent.
 func (s *Session) Stop() error {
 	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
 		return nil
@@ -162,15 +220,28 @@ func (s *Session) Stop() error {
 	if err := s.cap.Stop(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.stopPlayback(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
+	}
+	if s.playbackR != nil {
+		s.playbackR.Reset()
 	}
 	s.state.Store(int32(StateIdle))
 	return firstErr
 }
 
-// Close releases all resources. Must not be used afterward.
+func (s *Session) stopPlayback() error {
+	if s.playbackD == nil {
+		return nil
+	}
+	return s.playbackD.Stop()
+}
+
+// Close releases all resources.
 func (s *Session) Close() error {
 	_ = s.Stop()
 	var firstErr error
@@ -179,6 +250,12 @@ func (s *Session) Close() error {
 			firstErr = err
 		}
 		s.cap = nil
+	}
+	if s.playbackD != nil {
+		if err := s.playbackD.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.playbackD = nil
 	}
 	if s.pipeline != nil {
 		if err := s.pipeline.Close(); err != nil && firstErr == nil {
@@ -194,6 +271,14 @@ func (s *Session) Close() error {
 	return firstErr
 }
 
-// DroppedSamples reports samples captured but not forwarded — should
-// remain zero in steady state.
+// DroppedSamples reports samples captured but not forwarded.
 func (s *Session) DroppedSamples() uint64 { return s.drops.Load() }
+
+// PlaybackUnderruns reports samples the TTS playback device had to fill
+// with silence because the ringbuf was empty.
+func (s *Session) PlaybackUnderruns() uint64 {
+	if s.playbackD == nil {
+		return 0
+	}
+	return s.playbackD.Underruns()
+}

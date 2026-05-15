@@ -20,6 +20,21 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt/whisper"
 )
 
+// TTSEngine is implemented by internal/tts/piper.Engine (and any future
+// alternative). The Pipeline calls it after a successful MT step.
+type TTSEngine interface {
+	// Synthesize generates 22050 Hz mono int16 PCM for `text` in `lang`
+	// (ISO-639-1). The returned slice must be safe to retain.
+	Synthesize(ctx context.Context, text, lang string) ([]int16, error)
+}
+
+// AudioSink consumes PCM frames produced by TTS. The Pipeline writes
+// each successfully-synthesised utterance verbatim; the Sink is
+// expected to push them into a ring/device asynchronously.
+type AudioSink interface {
+	WritePCM(samples []int16)
+}
+
 // Event is emitted on the Pipeline's output channel for every recognised
 // utterance. When the Pipeline is configured without an MT engine,
 // Translation and TargetLang remain empty.
@@ -32,6 +47,8 @@ type Event struct {
 	Duration    time.Duration
 	STTLatency  time.Duration
 	MTLatency   time.Duration
+	TTSLatency  time.Duration
+	TTSSamples  int // 22050 Hz mono samples produced; 0 if TTS disabled
 }
 
 // Config groups the runtime parameters of the Pipeline. The VADConfig
@@ -48,6 +65,14 @@ type Config struct {
 	// TargetLang is the ISO-639-1 code Translation should produce.
 	// Ignored when MT is nil.
 	TargetLang string
+
+	// TTS synthesises translated text into PCM. nil disables TTS;
+	// the Pipeline still emits transcript+translation events.
+	TTS TTSEngine
+
+	// Audio consumes the TTS-produced PCM. nil disables playback even
+	// when TTS is set — the synthesized audio is dropped on the floor.
+	Audio AudioSink
 
 	// PromptHistory bounds how many recent finals are folded into the
 	// next Whisper InitialPrompt for context. Zero disables prompting.
@@ -70,11 +95,14 @@ func DefaultConfig() Config {
 	}
 }
 
-// Pipeline runs VAD + Whisper as a single coordinated unit.
+// Pipeline runs VAD + Whisper + (optional) MT + (optional) TTS as a
+// single coordinated unit.
 type Pipeline struct {
-	cfg     Config
-	seg     *vad.Segmenter
-	engine  *whisper.Engine
+	cfg    Config
+	seg    *vad.Segmenter
+	engine *whisper.Engine
+
+	ctx context.Context // set in Start; used by TTS Synthesize
 
 	out  chan Event
 	done chan struct{}
@@ -134,6 +162,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 }
 
 func (p *Pipeline) run(ctx context.Context) {
+	p.ctx = ctx
 	defer p.wg.Done()
 	defer close(p.out)
 	for {
@@ -196,6 +225,30 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 		}
 		// On MT error we still emit the transcript; the user sees it
 		// and can choose another model or language.
+	}
+
+	// TTS: synthesise the translation (or, if MT is disabled, the
+	// transcript) into PCM and hand it to the playback sink. We do
+	// this on the pipeline goroutine — sequential decoding keeps
+	// memory bounded and avoids reordered playback.
+	if p.cfg.TTS != nil {
+		spokenText := ev.Translation
+		spokenLang := ev.TargetLang
+		if spokenText == "" {
+			spokenText = ev.Text
+			spokenLang = ev.Language
+		}
+		if spokenText != "" && spokenLang != "" {
+			t0 := time.Now()
+			pcm, err := p.cfg.TTS.Synthesize(p.ctx, spokenText, spokenLang)
+			ev.TTSLatency = time.Since(t0)
+			if err == nil {
+				ev.TTSSamples = len(pcm)
+				if p.cfg.Audio != nil {
+					p.cfg.Audio.WritePCM(pcm)
+				}
+			}
+		}
 	}
 
 	select {

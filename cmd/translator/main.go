@@ -1,11 +1,17 @@
 // Command translator is the Fyne desktop frontend.
 //
-// M3a wires the MT engine after Whisper: the UI exposes source and
-// target language dropdowns plus a backend picker (MADLAD-400 default,
-// OPUS-MT alternative). The transcript pane is split into two columns —
-// recognised text on the left, translated text on the right.
+// M3b assembles the full audio loop. The UI exposes:
 //
-// TTS playback returns in M3b.
+//   - --model: path to a Whisper ggml file
+//   - --src / --dst: source and target language (ISO-639-1)
+//   - --mt madlad|opusmt|off plus per-backend paths
+//   - --tts on|off plus --piper-bin and per-language voice paths
+//
+// At runtime the user toggles the session Start/Stop and watches the
+// transcript and translation panes fill in. With --tts on the
+// translation is also spoken through the system playback device; with
+// the right virtual audio device selected (M4) it becomes a microphone
+// for other applications.
 package main
 
 import (
@@ -14,6 +20,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -24,7 +31,33 @@ import (
 
 	rstapp "github.com/alex60217101990/realtime-speech-translator/internal/app"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
+	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
 )
+
+type voiceFlag map[string]string
+
+func (f *voiceFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	out := make([]string, 0, len(*f))
+	for k, v := range *f {
+		out = append(out, k+"="+v)
+	}
+	return strings.Join(out, ",")
+}
+
+func (f *voiceFlag) Set(s string) error {
+	if *f == nil {
+		*f = map[string]string{}
+	}
+	parts := strings.SplitN(s, "=", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("expected lang=path, got %q", s)
+	}
+	(*f)[parts[0]] = parts[1]
+	return nil
+}
 
 func main() {
 	modelFlag := flag.String("model", "", "path to Whisper ggml model")
@@ -34,6 +67,12 @@ func main() {
 	mtOPUSRoot := flag.String("opusmt-root", "", "OPUS-MT models root with {src}-{dst} subdirs")
 	srcFlag := flag.String("src", "auto", "source language (ISO-639-1) or 'auto'")
 	dstFlag := flag.String("dst", "en", "target language (ISO-639-1)")
+
+	ttsOn := flag.Bool("tts", true, "enable Piper TTS playback of translations")
+	piperBin := flag.String("piper-bin", "", "path to piper executable (default: lookup on PATH)")
+	var voices voiceFlag
+	flag.Var(&voices, "voice", "register a Piper voice as lang=onnx-path; repeat for multiple languages")
+
 	flag.Parse()
 
 	modelPath, err := resolveModelPath(*modelFlag)
@@ -64,9 +103,28 @@ func main() {
 			cfg.MTBackend = eng
 		}
 	case "off":
-		// transcript-only mode
 	default:
 		log.Fatalf("unknown --mt backend: %s", *mtBackend)
+	}
+
+	if *ttsOn {
+		pcfg := piper.DefaultConfig()
+		pcfg.BinaryPath = *piperBin
+		peng, err := piper.New(pcfg)
+		if err != nil {
+			log.Printf("tts disabled: %v", err)
+		} else {
+			for lang, path := range voices {
+				if err := peng.AddVoice(piper.Voice{Lang: lang, ONNXPath: path}); err != nil {
+					log.Printf("tts voice %s skipped: %v", lang, err)
+				}
+			}
+			if peng.HasVoice(cfg.TargetLang) {
+				cfg.TTSBackend = peng
+			} else {
+				log.Printf("tts disabled: no voice registered for target %q", cfg.TargetLang)
+			}
+		}
 	}
 
 	sess, err := rstapp.New(cfg)
@@ -81,12 +139,12 @@ func main() {
 
 	a := app.NewWithID("io.github.alex60217101990.rst")
 	w := a.NewWindow("Realtime Speech Translator")
-	w.Resize(fyne.NewSize(880, 520))
+	w.Resize(fyne.NewSize(960, 560))
 
 	statusBind := binding.NewString()
 	_ = statusBind.Set("Status: idle")
 	statsBind := binding.NewString()
-	_ = statsBind.Set("STT: —   MT: —   Drops: 0")
+	_ = statsBind.Set("STT: —   MT: —   TTS: —   Drops: 0   Underruns: 0")
 	transcriptBind := binding.NewString()
 	translationBind := binding.NewString()
 	_ = transcriptBind.Set("")
@@ -96,14 +154,18 @@ func main() {
 	statsLbl := widget.NewLabelWithData(statsBind)
 	transcriptArea := widget.NewMultiLineEntry()
 	transcriptArea.Bind(transcriptBind)
-	transcriptArea.SetMinRowsVisible(12)
+	transcriptArea.SetMinRowsVisible(14)
 	translationArea := widget.NewMultiLineEntry()
 	translationArea.Bind(translationBind)
-	translationArea.SetMinRowsVisible(12)
+	translationArea.SetMinRowsVisible(14)
 
+	ttsStatus := "off"
+	if cfg.TTSBackend != nil {
+		ttsStatus = "piper"
+	}
 	srcLabel := widget.NewLabel(fmt.Sprintf("Source: %s", cfg.SourceLang))
 	dstLabel := widget.NewLabel(fmt.Sprintf("Target: %s", cfg.TargetLang))
-	backendLabel := widget.NewLabel(fmt.Sprintf("MT: %s", *mtBackend))
+	backendLabel := widget.NewLabel(fmt.Sprintf("MT: %s   TTS: %s", *mtBackend, ttsStatus))
 
 	var btn *widget.Button
 	btn = widget.NewButton("Start", func() {
@@ -131,10 +193,14 @@ func main() {
 				cur2, _ := translationBind.Get()
 				_ = translationBind.Set(cur2 + fmt.Sprintf("[%s] %s\n", ev.TargetLang, ev.Translation))
 			}
-			_ = statsBind.Set(fmt.Sprintf("STT: %s   MT: %s   Drops: %d",
+			_ = statsBind.Set(fmt.Sprintf(
+				"STT: %s   MT: %s   TTS: %s   Drops: %d   Underruns: %d",
 				ev.STTLatency.Round(time.Millisecond),
 				ev.MTLatency.Round(time.Millisecond),
-				sess.DroppedSamples()))
+				ev.TTSLatency.Round(time.Millisecond),
+				sess.DroppedSamples(),
+				sess.PlaybackUnderruns(),
+			))
 		}
 	}()
 
