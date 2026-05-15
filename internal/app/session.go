@@ -1,10 +1,14 @@
 // Package app provides the high-level composition root for the
-// realtime-speech-translator daemon. M1 implements only the audio
-// loopback path (mic -> ringbuf -> playback); later milestones extend it
-// with VAD, STT, MT and TTS stages.
+// realtime-speech-translator daemon.
+//
+// M1 implemented the audio loopback. M2 adds VAD + Whisper: the capture
+// stream is forwarded into the STT pipeline, which emits Transcript
+// events on a channel consumed by the UI. The playback device is not
+// opened in M2 — TTS-driven playback returns in M3.
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -12,8 +16,7 @@ import (
 	"github.com/gen2brain/malgo"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/capture"
-	"github.com/alex60217101990/realtime-speech-translator/internal/audio/playback"
-	"github.com/alex60217101990/realtime-speech-translator/internal/audio/ringbuf"
+	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 )
 
 // State enumerates the user-visible session states. Stored atomically so
@@ -44,91 +47,98 @@ func (s State) String() string {
 	return "unknown"
 }
 
-// Config bundles the runtime parameters for a Session.
+// Config bundles runtime parameters for a Session.
 type Config struct {
-	SampleRate     uint32
-	RingbufSamples int
+	SampleRate   uint32
+	ModelPath    string
+	SourceLang   string // ISO-639-1 or "auto"
+	PipelineConf stt.Config
 }
 
-// DefaultConfig returns a Config tuned for 16 kHz mono speech (Whisper
-// input rate) with a ~256 ms ring buffer.
+// DefaultConfig returns a Config tuned for 16 kHz Whisper input.
 func DefaultConfig() Config {
 	return Config{
-		SampleRate:     16000,
-		RingbufSamples: 4096,
+		SampleRate:   16000,
+		SourceLang:   "auto",
+		PipelineConf: stt.DefaultConfig(),
 	}
 }
 
-// Session owns the audio devices and the buffer that connects them. M1
-// performs a direct loopback; later milestones replace the consumer side
-// of the ring with a VAD segmenter.
+// Session owns the audio capture device and the STT pipeline.
 type Session struct {
 	cfg   Config
 	state atomic.Int32
 	drops atomic.Uint64
 
-	ctx *malgo.AllocatedContext
-	cap *capture.Source
-	pb  *playback.Sink
-	rb  *ringbuf.Ring
+	mctx     *malgo.AllocatedContext
+	cap      *capture.Source
+	pipeline *stt.Pipeline
+	cancel   context.CancelFunc
 }
 
-// New constructs a Session with audio devices initialised but not yet
-// started. The miniaudio context is owned by the Session and freed by
-// Close.
+// New constructs a Session with the audio device and STT pipeline
+// initialised but not yet running. ModelPath must point at a Whisper
+// ggml-format model file.
 func New(cfg Config) (*Session, error) {
 	if cfg.SampleRate == 0 {
 		return nil, errors.New("app: SampleRate must be set")
 	}
-	if cfg.RingbufSamples <= 0 {
-		return nil, errors.New("app: RingbufSamples must be positive")
+	if cfg.ModelPath == "" {
+		return nil, errors.New("app: ModelPath must be set")
 	}
 
-	rb, err := ringbuf.New(cfg.RingbufSamples)
+	pcfg := cfg.PipelineConf
+	if pcfg.Engine.Language == "" {
+		pcfg.Engine.Language = cfg.SourceLang
+	}
+	pipeline, err := stt.New(cfg.ModelPath, pcfg)
 	if err != nil {
-		return nil, fmt.Errorf("app: ringbuf: %w", err)
+		return nil, fmt.Errorf("app: stt pipeline: %w", err)
 	}
 
 	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
+		_ = pipeline.Close()
 		return nil, fmt.Errorf("app: init miniaudio context: %w", err)
 	}
 
-	s := &Session{cfg: cfg, ctx: mctx, rb: rb}
+	s := &Session{cfg: cfg, mctx: mctx, pipeline: pipeline}
 
-	cap, err := capture.New(mctx, capture.Config{SampleRate: cfg.SampleRate}, &ringSink{rb: rb, drops: &s.drops})
+	cap, err := capture.New(mctx, capture.Config{SampleRate: cfg.SampleRate}, &sttSink{
+		pipeline: pipeline,
+		drops:    &s.drops,
+	})
 	if err != nil {
 		_ = mctx.Uninit()
 		mctx.Free()
+		_ = pipeline.Close()
 		return nil, err
 	}
-	pb, err := playback.New(mctx, playback.Config{SampleRate: cfg.SampleRate}, &ringSource{rb: rb})
-	if err != nil {
-		_ = cap.Close()
-		_ = mctx.Uninit()
-		mctx.Free()
-		return nil, err
-	}
-
 	s.cap = cap
-	s.pb = pb
 	return s, nil
 }
+
+// Events returns the channel that emits recognised utterances. It is
+// closed by Close.
+func (s *Session) Events() <-chan stt.Event { return s.pipeline.Output() }
 
 // State returns the current session state.
 func (s *Session) State() State { return State(s.state.Load()) }
 
-// Start activates the audio devices.
+// Start activates the capture device and the STT pipeline.
 func (s *Session) Start() error {
 	if !s.state.CompareAndSwap(int32(StateIdle), int32(StateStarting)) {
 		return fmt.Errorf("app: cannot start from state %s", State(s.state.Load()))
 	}
-	if err := s.cap.Start(); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	if err := s.pipeline.Start(ctx); err != nil {
+		cancel()
 		s.state.Store(int32(StateError))
 		return err
 	}
-	if err := s.pb.Start(); err != nil {
-		_ = s.cap.Stop()
+	if err := s.cap.Start(); err != nil {
+		cancel()
 		s.state.Store(int32(StateError))
 		return err
 	}
@@ -136,52 +146,47 @@ func (s *Session) Start() error {
 	return nil
 }
 
-// Stop halts the audio devices and clears the ring buffer.
+// Stop halts the audio device and the pipeline. Idempotent.
 func (s *Session) Stop() error {
 	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
 		return nil
 	}
 	var firstErr error
-	if err := s.pb.Stop(); err != nil && firstErr == nil {
-		firstErr = err
-	}
 	if err := s.cap.Stop(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	s.rb.Reset()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
 	s.state.Store(int32(StateIdle))
 	return firstErr
 }
 
-// Close releases all resources. The Session must not be used afterward.
+// Close releases all resources. Must not be used afterward.
 func (s *Session) Close() error {
 	_ = s.Stop()
 	var firstErr error
-	if s.pb != nil {
-		if err := s.pb.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		s.pb = nil
-	}
 	if s.cap != nil {
 		if err := s.cap.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		s.cap = nil
 	}
-	if s.ctx != nil {
-		_ = s.ctx.Uninit()
-		s.ctx.Free()
-		s.ctx = nil
+	if s.pipeline != nil {
+		if err := s.pipeline.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.pipeline = nil
+	}
+	if s.mctx != nil {
+		_ = s.mctx.Uninit()
+		s.mctx.Free()
+		s.mctx = nil
 	}
 	return firstErr
 }
 
-// DroppedSamples reports the cumulative count of captured samples
-// dropped because the ring buffer was full when the capture callback
-// fired.
+// DroppedSamples reports samples captured but not forwarded — should
+// remain zero in steady state.
 func (s *Session) DroppedSamples() uint64 { return s.drops.Load() }
-
-// Underruns reports the cumulative count of samples the playback device
-// had to fill with silence because the ring buffer was empty.
-func (s *Session) Underruns() uint64 { return s.pb.Underruns() }
