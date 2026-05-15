@@ -16,25 +16,38 @@ import (
 	"time"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/vad"
+	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt/whisper"
 )
 
 // Event is emitted on the Pipeline's output channel for every recognised
-// utterance.
+// utterance. When the Pipeline is configured without an MT engine,
+// Translation and TargetLang remain empty.
 type Event struct {
-	Text     string
-	Language string
-	Started  time.Time
-	Duration time.Duration
-	Latency  time.Duration // STT processing time
+	Text        string
+	Language    string
+	Translation string
+	TargetLang  string
+	Started     time.Time
+	Duration    time.Duration
+	STTLatency  time.Duration
+	MTLatency   time.Duration
 }
 
 // Config groups the runtime parameters of the Pipeline. The VADConfig
 // and EngineConfig give callers full control over the underlying
 // components; sensible defaults are exposed via DefaultConfig.
 type Config struct {
-	VAD     vad.Config
-	Engine  whisper.Config
+	VAD    vad.Config
+	Engine whisper.Config
+
+	// MT is the translation engine. nil disables translation (the
+	// Pipeline still emits transcript-only events).
+	MT mt.Engine
+
+	// TargetLang is the ISO-639-1 code Translation should produce.
+	// Ignored when MT is nil.
+	TargetLang string
 
 	// PromptHistory bounds how many recent finals are folded into the
 	// next Whisper InitialPrompt for context. Zero disables prompting.
@@ -166,12 +179,25 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	}
 
 	ev := Event{
-		Text:     text,
-		Language: tr.Language,
-		Started:  ut.StartedAt,
-		Duration: ut.Duration,
-		Latency:  tr.Latency,
+		Text:       text,
+		Language:   tr.Language,
+		Started:    ut.StartedAt,
+		Duration:   ut.Duration,
+		STTLatency: tr.Latency,
 	}
+
+	if p.cfg.MT != nil && p.cfg.TargetLang != "" && tr.Language != p.cfg.TargetLang {
+		t0 := time.Now()
+		translation, err := p.cfg.MT.Translate(text, tr.Language, p.cfg.TargetLang)
+		ev.MTLatency = time.Since(t0)
+		if err == nil {
+			ev.Translation = translation
+			ev.TargetLang = p.cfg.TargetLang
+		}
+		// On MT error we still emit the transcript; the user sees it
+		// and can choose another model or language.
+	}
+
 	select {
 	case p.out <- ev:
 	default:

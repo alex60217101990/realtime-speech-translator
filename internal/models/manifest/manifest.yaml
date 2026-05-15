@@ -19,7 +19,27 @@ whisper:
     sha256: 6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208
     size_mb: 1500
 
-# MT and TTS entries are placeholders until M3 wires CTranslate2 and
-# Piper. The downloader treats them as future targets.
-mt: {}
+# Machine translation models. Both backends share the CTranslate2
+# runtime; OPUS-MT additionally requires per-pair sentencepiece models
+# (source.spm + target.spm) bundled alongside the ct2 export.
+mt:
+  madlad-400-3b-int8:
+    # Default — Apache-2.0, 419 languages, MADLAD-400-3B int8 export.
+    url: https://huggingface.co/santhosh/madlad400-3b-ct2/resolve/main/model.bin
+    config_url: https://huggingface.co/santhosh/madlad400-3b-ct2/resolve/main/config.json
+    tokenizer_url: https://huggingface.co/santhosh/madlad400-3b-ct2/resolve/main/sentencepiece.model
+    size_mb: 1600
+    default: true
+
+  m2m100-418m-int8:
+    # MIT, smaller fallback for resource-constrained machines.
+    url: https://huggingface.co/JustFrederik/m2m100_418M-ct2-int8/resolve/main/model.bin
+    config_url: https://huggingface.co/JustFrederik/m2m100_418M-ct2-int8/resolve/main/config.json
+    tokenizer_url: https://huggingface.co/JustFrederik/m2m100_418M-ct2-int8/resolve/main/sentencepiece.bpe.model
+    size_mb: 500
+
+# OPUS-MT models are organised per language pair; the application
+# composes the URL at runtime from a base + pair (e.g. "ru-en"). Keep
+# this list short — common pairs only — and let the user opt in to
+# extras via the Models Manager UI.
 tts: {}

@@ -19,7 +19,8 @@ cssclasses:
 
 ### Architecture
 - [[architecture/Audio Pipeline]] — capture → VAD → STT → MT → TTS → playback
-- [[architecture/STT Pipeline M2]] — current milestone wiring, thread model, backpressure
+- [[architecture/STT Pipeline M2]] — M2 milestone wiring (VAD + Whisper)
+- [[architecture/MT Stage M3a]] — M3a MT integration (MADLAD/OPUS-MT via CT2+SP)
 - [[architecture/Goroutine Model]] — channels, backpressure, OS-thread locking
 - [[architecture/Cgo Boundary]] — where cgo lives, why, build implications
 
@@ -27,6 +28,8 @@ cssclasses:
 - [[libraries/malgo]] — miniaudio Go binding, callback semantics
 - [[libraries/whisper.cpp]] — STT, bindings/go submodule, build wiring
 - [[libraries/go-webrtcvad]] — VAD frames, byte input format
+- [[libraries/CTranslate2]] — Transformer inference for MT; cgo shim and 30+ static libs
+- [[libraries/SentencePiece]] — subword tokenizer for MT; abseil merge gotcha
 - [[libraries/Fyne v2]] — UI framework, thread-safety, widget binding
 - [[libraries/Go 1.26 SIMD]] — `simd/archsimd`, build tag, AVX2 path
 
@@ -39,9 +42,10 @@ cssclasses:
 ### Decisions
 - [[decisions/ADR-001 Desktop Only]] — drop iOS/Android, virtual mic feasibility
 - [[decisions/ADR-002 Piper over XTTS]] — neutral voice, resource budget
-- [[decisions/ADR-003 NLLB CC-BY-NC]] — licensing implications
+- [[decisions/ADR-003 NLLB CC-BY-NC]] — licensing implications (now superseded)
 - [[decisions/ADR-004 Monolithic cgo Binary]] — no sidecars
 - [[decisions/ADR-005 Fyne over Wails Flutter]] — pure Go, mobile-ready
+- [[decisions/ADR-007 MADLAD over NLLB]] — default MT, Apache-2.0, 419 languages
 
 ### Gotchas
 - [[gotchas/CGO_ENABLED Required]] — malgo, vad, whisper all need cgo
@@ -49,6 +53,8 @@ cssclasses:
 - [[gotchas/VAD Hangover Inflates Duration]] — track speech-only ms separately
 - [[gotchas/Whisper Build Env]] — `C_INCLUDE_PATH` + `LIBRARY_PATH` mandatory
 - [[gotchas/Audio Thread No Allocation]] — capture/playback callbacks must be alloc-free
+- [[gotchas/SP Abseil Static Bundling]] — SP doesn't bundle abseil; merge `libabsl_combined.a`
+- [[gotchas/CT2 Linker Symphony]] — 30+ static libs in cgo LDFLAGS, CMake policy override
 
 ## Conventions
 
@@ -70,3 +76,4 @@ cssclasses:
 
 - 2026-05-15 — M1 skeleton committed (`ea9f21f`).
 - 2026-05-15 — M2 done: whisper.cpp `v1.8.4` submodule, static libs built, [[libraries/go-webrtcvad]] integrated, [[libraries/whisper.cpp|whisper]] Go wrapper, [[architecture/STT Pipeline M2|VAD→Whisper pipeline]] wired into [[../../internal/app/session.go|Session]], Fyne transcript pane. Downloader supports resume + sha256 + retry. Tests + race + vet green.
+- 2026-05-15 — M3a done: [[libraries/CTranslate2|CTranslate2 v4.7.1]] + [[libraries/SentencePiece|SentencePiece v0.2.1]] submodules + cgo shims. MT engine interface with [[architecture/MT Stage M3a|MADLAD-400-3B (Apache-2.0, default)]] and per-pair OPUS-MT backends. Manifest updated, UI split into transcript/translation panes. ADR-007 supersedes NLLB. Build wiring documented in [[gotchas/CT2 Linker Symphony]] and [[gotchas/SP Abseil Static Bundling]].

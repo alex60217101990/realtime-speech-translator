@@ -13,23 +13,42 @@ LDFLAGS      := -s -w
 UNAME_S      := $(shell uname -s)
 
 # --- whisper.cpp env wiring -------------------------------------------------
-# The bindings declare LDFLAGS but rely on the caller to set include and
-# library paths. We pass them via C_INCLUDE_PATH and LIBRARY_PATH so the
-# linker/preprocessor find the static libs produced by scripts/build-deps.sh.
 WHISPER_DIR  := $(abspath third_party/whisper.cpp)
 WHISPER_BUILD:= $(WHISPER_DIR)/build_go
 WHISPER_INC  := $(WHISPER_DIR)/include:$(WHISPER_DIR)/ggml/include
 WHISPER_LIB  := $(WHISPER_BUILD)/src:$(WHISPER_BUILD)/ggml/src
 ifeq ($(UNAME_S),Darwin)
 WHISPER_LIB  := $(WHISPER_LIB):$(WHISPER_BUILD)/ggml/src/ggml-blas:$(WHISPER_BUILD)/ggml/src/ggml-metal
-# Metal shaders are loaded from this prefix at runtime.
 export GGML_METAL_PATH_RESOURCES := $(WHISPER_DIR)
 endif
 
+# --- sentencepiece env wiring -----------------------------------------------
+SP_DIR    := $(abspath third_party/sentencepiece)
+SP_BUILD  := $(SP_DIR)/build_go
+SP_INC    := $(SP_DIR)/src:$(SP_BUILD)/src
+SP_LIB    := $(SP_BUILD)/src
+
+# --- ctranslate2 env wiring -------------------------------------------------
+CT2_DIR   := $(abspath third_party/ctranslate2)
+CT2_BUILD := $(CT2_DIR)/build_go
+CT2_INC   := $(CT2_DIR)/include
+# CT2 is itself a single static lib; ruy, cpu_features and ruy's
+# bundled cpuinfo / clog are nested.
+CT2_LIB   := $(CT2_BUILD):$(CT2_BUILD)/third_party/cpu_features:$(CT2_BUILD)/third_party/ruy/ruy:$(CT2_BUILD)/third_party/ruy/third_party/cpuinfo:$(CT2_BUILD)/third_party/ruy/third_party/cpuinfo/deps/clog
+
 export CGO_ENABLED
 export GOEXPERIMENT
-export C_INCLUDE_PATH := $(WHISPER_INC):$(C_INCLUDE_PATH)
-export LIBRARY_PATH   := $(WHISPER_LIB):$(LIBRARY_PATH)
+# CPATH covers both C and C++ search paths (whereas C_INCLUDE_PATH is
+# C-only). Cgo shims for SentencePiece and CTranslate2 are C++, so we
+# need CPATH so #include resolves under the cgo build.
+export CPATH          := $(WHISPER_INC):$(SP_INC):$(CT2_INC):$(CPATH)
+export C_INCLUDE_PATH := $(WHISPER_INC):$(SP_INC):$(CT2_INC):$(C_INCLUDE_PATH)
+export LIBRARY_PATH   := $(WHISPER_LIB):$(SP_LIB):$(CT2_LIB):$(LIBRARY_PATH)
+
+# CTranslate2 vendored headers (half_float, nlohmann/json) trigger
+# deprecation warnings under modern clang; silence to keep build output
+# readable.
+export CGO_CXXFLAGS := -Wno-deprecated-literal-operator $(CGO_CXXFLAGS)
 
 .PHONY: all build run test test-race vet lint bench tidy clean deps deps-whisper
 
@@ -39,10 +58,16 @@ $(BIN_DIR):
 	@mkdir -p $@
 
 # --- native deps ------------------------------------------------------------
-deps: deps-whisper
+deps: deps-whisper deps-sentencepiece deps-ctranslate2
 
 deps-whisper:
 	./scripts/build-deps.sh whisper
+
+deps-sentencepiece:
+	./scripts/build-deps.sh sentencepiece
+
+deps-ctranslate2:
+	./scripts/build-deps.sh ctranslate2
 
 # --- Go ---------------------------------------------------------------------
 build: | $(BIN_DIR)

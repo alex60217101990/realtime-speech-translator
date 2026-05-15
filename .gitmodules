@@ -1,3 +1,9 @@
 [submodule "third_party/whisper.cpp"]
 	path = third_party/whisper.cpp
 	url = https://github.com/ggerganov/whisper.cpp
+[submodule "third_party/sentencepiece"]
+	path = third_party/sentencepiece
+	url = https://github.com/google/sentencepiece
+[submodule "third_party/ctranslate2"]
+	path = third_party/ctranslate2
+	url = https://github.com/OpenNMT/CTranslate2

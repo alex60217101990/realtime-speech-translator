@@ -16,6 +16,7 @@ import (
 	"github.com/gen2brain/malgo"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/capture"
+	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 )
 
@@ -52,6 +53,8 @@ type Config struct {
 	SampleRate   uint32
 	ModelPath    string
 	SourceLang   string // ISO-639-1 or "auto"
+	TargetLang   string // ISO-639-1, empty disables MT
+	MTBackend    mt.Engine
 	PipelineConf stt.Config
 }
 
@@ -90,6 +93,10 @@ func New(cfg Config) (*Session, error) {
 	pcfg := cfg.PipelineConf
 	if pcfg.Engine.Language == "" {
 		pcfg.Engine.Language = cfg.SourceLang
+	}
+	if cfg.MTBackend != nil && cfg.TargetLang != "" {
+		pcfg.MT = mt.Serial(cfg.MTBackend)
+		pcfg.TargetLang = cfg.TargetLang
 	}
 	pipeline, err := stt.New(cfg.ModelPath, pcfg)
 	if err != nil {
