@@ -63,7 +63,11 @@ type Config struct {
 	// audio device. Must be a power of two. Zero defaults to 65536
 	// (~3 s at 22050 Hz) which absorbs Piper's bursty output.
 	PlaybackBufferSamples int
-	PipelineConf          stt.Config
+	// PlaybackDeviceID, when non-nil, selects a specific output device
+	// (typically the virtual mic discovered via internal/vmic). nil
+	// means the OS default output.
+	PlaybackDeviceID *malgo.DeviceID
+	PipelineConf     stt.Config
 }
 
 // DefaultConfig returns a Config tuned for 16 kHz Whisper input and
@@ -161,7 +165,10 @@ func New(cfg Config) (*Session, error) {
 	s.cap = cap
 
 	if cfg.TTSBackend != nil {
-		pb, err := playback.New(mctx, playback.Config{SampleRate: cfg.TTSRate}, &playbackSource{rb: s.playbackR})
+		pb, err := playback.New(mctx, playback.Config{
+			SampleRate: cfg.TTSRate,
+			DeviceID:   cfg.PlaybackDeviceID,
+		}, &playbackSource{rb: s.playbackR})
 		if err != nil {
 			_ = cap.Close()
 			_ = pipeline.Close()

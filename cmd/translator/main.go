@@ -1,23 +1,23 @@
 // Command translator is the Fyne desktop frontend.
 //
-// M3b assembles the full audio loop. The UI exposes:
+// M4 layered virtual-mic detection and a startup install guide on top
+// of M3b's TTS pipeline. The application now:
 //
-//   - --model: path to a Whisper ggml file
-//   - --src / --dst: source and target language (ISO-639-1)
-//   - --mt madlad|opusmt|off plus per-backend paths
-//   - --tts on|off plus --piper-bin and per-language voice paths
-//
-// At runtime the user toggles the session Start/Stop and watches the
-// transcript and translation panes fill in. With --tts on the
-// translation is also spoken through the system playback device; with
-// the right virtual audio device selected (M4) it becomes a microphone
-// for other applications.
+//   1. Enumerates playback devices via internal/vmic.
+//   2. Picks a virtual-mic device (BlackHole / VB-CABLE / PulseAudio
+//      null sink) automatically; --output-device "name substring"
+//      overrides the choice.
+//   3. If no virtual mic is found, opens a dialog walking the user
+//      through installing one. The session still starts in
+//      "preview only" mode so the user can verify STT+MT+TTS work
+//      against the system speakers while the driver is installing.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,11 +27,14 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
+	"github.com/gen2brain/malgo"
 
 	rstapp "github.com/alex60217101990/realtime-speech-translator/internal/app"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
+	"github.com/alex60217101990/realtime-speech-translator/internal/vmic"
 )
 
 type voiceFlag map[string]string
@@ -73,6 +76,8 @@ func main() {
 	var voices voiceFlag
 	flag.Var(&voices, "voice", "register a Piper voice as lang=onnx-path; repeat for multiple languages")
 
+	outDevSub := flag.String("output-device", "", "playback device name substring (default: first detected virtual mic, else system default)")
+
 	flag.Parse()
 
 	modelPath, err := resolveModelPath(*modelFlag)
@@ -84,6 +89,15 @@ func main() {
 	cfg.ModelPath = modelPath
 	cfg.SourceLang = *srcFlag
 	cfg.TargetLang = *dstFlag
+
+	// Pick playback device. We do this before constructing the
+	// Session so the device decision is visible in startup logs.
+	chosenDevName, chosenDevKind, missingVMic := pickPlaybackDevice(*outDevSub, &cfg)
+	if missingVMic {
+		log.Printf("vmic: no virtual mic detected — falling back to default output (preview mode)")
+	} else {
+		log.Printf("vmic: routing to %q (%s)", chosenDevName, chosenDevKind)
+	}
 
 	switch *mtBackend {
 	case "madlad":
@@ -139,7 +153,7 @@ func main() {
 
 	a := app.NewWithID("io.github.alex60217101990.rst")
 	w := a.NewWindow("Realtime Speech Translator")
-	w.Resize(fyne.NewSize(960, 560))
+	w.Resize(fyne.NewSize(960, 600))
 
 	statusBind := binding.NewString()
 	_ = statusBind.Set("Status: idle")
@@ -163,9 +177,13 @@ func main() {
 	if cfg.TTSBackend != nil {
 		ttsStatus = "piper"
 	}
+	vmicStatus := "not found"
+	if !missingVMic {
+		vmicStatus = chosenDevName
+	}
 	srcLabel := widget.NewLabel(fmt.Sprintf("Source: %s", cfg.SourceLang))
 	dstLabel := widget.NewLabel(fmt.Sprintf("Target: %s", cfg.TargetLang))
-	backendLabel := widget.NewLabel(fmt.Sprintf("MT: %s   TTS: %s", *mtBackend, ttsStatus))
+	backendLabel := widget.NewLabel(fmt.Sprintf("MT: %s   TTS: %s   VMic: %s", *mtBackend, ttsStatus, vmicStatus))
 
 	var btn *widget.Button
 	btn = widget.NewButton("Start", func() {
@@ -228,7 +246,110 @@ func main() {
 		w.Close()
 		os.Exit(0)
 	})
+
+	// First-paint hook to surface the install wizard if no virtual
+	// mic was detected. We do this after the window is built so the
+	// dialog has a parent to attach to.
+	if missingVMic {
+		w.SetOnClosed(func() { os.Exit(0) })
+		go func() {
+			time.Sleep(150 * time.Millisecond) // let the main window settle
+			showVMicWizard(a, w)
+		}()
+	}
+
 	w.ShowAndRun()
+}
+
+// pickPlaybackDevice picks a virtual-mic playback device and stamps its
+// ID into cfg.PlaybackDeviceID. Returns the resolved name + kind for
+// display, and a missingVMic flag that the UI uses to trigger the
+// install wizard. When override is non-empty it takes precedence over
+// auto-detection.
+func pickPlaybackDevice(override string, cfg *rstapp.Config) (name string, kind string, missing bool) {
+	if override != "" {
+		all, err := vmic.AllQuick()
+		if err != nil {
+			log.Printf("vmic: enumerate failed: %v", err)
+			return "", "", true
+		}
+		needle := strings.ToLower(override)
+		for i := range all {
+			if strings.Contains(strings.ToLower(all[i].Name), needle) {
+				id := all[i].ID
+				cfg.PlaybackDeviceID = &id
+				return all[i].Name, all[i].Kind.String(), false
+			}
+		}
+		log.Printf("vmic: --output-device %q did not match any device, falling back", override)
+	}
+
+	found, err := vmic.DetectQuick()
+	if err != nil {
+		log.Printf("vmic: detect failed: %v", err)
+		return "", "", true
+	}
+	if len(found) == 0 {
+		return "", "", true
+	}
+	id := found[0].ID
+	cfg.PlaybackDeviceID = &id
+	return found[0].Name, found[0].Kind.String(), false
+}
+
+// showVMicWizard renders a non-blocking modal walking the user through
+// installing a virtual-mic driver appropriate for their OS. We use a
+// custom-confirm dialog rather than dialog.ShowCustom because we want
+// to expose three distinct actions: open URL, auto-install (Linux), and
+// dismiss-and-recheck.
+func showVMicWizard(a fyne.App, w fyne.Window) {
+	g := vmic.GuideFor()
+
+	body := container.NewVBox(
+		widget.NewLabel(g.Title),
+		widget.NewLabel("Without a virtual mic, the translator can speak audio out of your speakers but other apps (Zoom, Discord) will not see it as a microphone input."),
+	)
+	for i, step := range g.Steps {
+		body.Add(widget.NewLabel(fmt.Sprintf("%d. %s", i+1, step)))
+	}
+	if g.AutoInstallCmd != "" {
+		body.Add(widget.NewLabel(""))
+		body.Add(widget.NewLabel("Command:"))
+		cmdLbl := widget.NewLabel(g.AutoInstallCmd)
+		cmdLbl.Wrapping = fyne.TextWrapBreak
+		body.Add(cmdLbl)
+	}
+
+	d := dialog.NewCustomConfirm("Virtual microphone setup", "Continue (preview only)", "Open install page", body, func(openURL bool) {
+		if openURL && g.URL != "" {
+			if u, err := url.Parse(g.URL); err == nil {
+				_ = a.OpenURL(u)
+			}
+		}
+	}, w)
+	d.Resize(fyne.NewSize(640, 420))
+	d.Show()
+
+	// Linux-only: offer a separate "auto-install" path. We can't add
+	// a third button to the confirm dialog without forking the widget,
+	// so prompt the user with a follow-up.
+	if g.AutoInstallCmd != "" {
+		go func() {
+			time.Sleep(120 * time.Millisecond)
+			dialog.ShowConfirm("Auto-install null sink?",
+				"Linux only: run pactl to create a null sink right now? You can also copy the command from the previous window and run it yourself.",
+				func(ok bool) {
+					if !ok {
+						return
+					}
+					if err := vmic.AutoInstall(); err != nil {
+						dialog.ShowError(err, w)
+						return
+					}
+					dialog.ShowInformation("Done", "Null sink loaded. Restart the application so it picks up the new device.", w)
+				}, w)
+		}()
+	}
 }
 
 func resolveModelPath(flag string) (string, error) {
@@ -241,3 +362,7 @@ func resolveModelPath(flag string) (string, error) {
 	}
 	return filepath.Join(cache, "realtime-speech-translator", "models", "whisper", "ggml-small.bin"), nil
 }
+
+// _ keeps the malgo import alive even when only DeviceID is touched via
+// pickPlaybackDevice; gofmt would otherwise remove the import.
+var _ = malgo.Playback

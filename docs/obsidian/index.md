@@ -22,6 +22,7 @@ cssclasses:
 - [[architecture/STT Pipeline M2]] — M2 milestone wiring (VAD + Whisper)
 - [[architecture/MT Stage M3a]] — M3a MT integration (MADLAD/OPUS-MT via CT2+SP)
 - [[architecture/TTS Stage M3b]] — M3b TTS + playback (Piper subprocess, ringbuf)
+- [[architecture/Virtual Mic M4]] — M4 virtual-mic detection + guided install
 - [[architecture/Goroutine Model]] — channels, backpressure, OS-thread locking
 - [[architecture/Cgo Boundary]] — where cgo lives, why, build implications
 
@@ -47,6 +48,7 @@ cssclasses:
 - [[decisions/ADR-003 NLLB CC-BY-NC]] — licensing implications (now superseded)
 - [[decisions/ADR-004 Monolithic cgo Binary]] — no sidecars
 - [[decisions/ADR-005 Fyne over Wails Flutter]] — pure Go, mobile-ready
+- [[decisions/ADR-006 Virtual Mic Guided Install]] — detect, never bundle; Linux auto-install only
 - [[decisions/ADR-007 MADLAD over NLLB]] — default MT, Apache-2.0, 419 languages
 - [[decisions/ADR-008 Piper Subprocess]] — TTS via subprocess for M3b, cgo migration deferred
 
@@ -81,3 +83,4 @@ cssclasses:
 - 2026-05-15 — M2 done: whisper.cpp `v1.8.4` submodule, static libs built, [[libraries/go-webrtcvad]] integrated, [[libraries/whisper.cpp|whisper]] Go wrapper, [[architecture/STT Pipeline M2|VAD→Whisper pipeline]] wired into [[../../internal/app/session.go|Session]], Fyne transcript pane. Downloader supports resume + sha256 + retry. Tests + race + vet green.
 - 2026-05-15 — M3a done: [[libraries/CTranslate2|CTranslate2 v4.7.1]] + [[libraries/SentencePiece|SentencePiece v0.2.1]] submodules + cgo shims. MT engine interface with [[architecture/MT Stage M3a|MADLAD-400-3B (Apache-2.0, default)]] and per-pair OPUS-MT backends. Manifest updated, UI split into transcript/translation panes. ADR-007 supersedes NLLB. Build wiring documented in [[gotchas/CT2 Linker Symphony]] and [[gotchas/SP Abseil Static Bundling]].
 - 2026-05-15 — M3b done: [[libraries/Piper TTS|Piper TTS subprocess]] wrapper, playback device reintroduced, [[architecture/TTS Stage M3b|TTS branch wired into Pipeline]]. Manifest grew with 5 default voices (en/ru/es/de/fr). `--tts on` + `--voice lang=path` on CLI. End-to-end loop closed: speaker hears translated audio. ADR-008 documents subprocess-over-cgo decision and migration plan.
+- 2026-05-15 — M4 done: [[architecture/Virtual Mic M4|internal/vmic]] enumerates BlackHole / VB-CABLE / PulseAudio null-sink across platforms; Session accepts `PlaybackDeviceID`; first-launch install wizard with OS-specific guidance and Linux auto-install via `pactl`. ADR-006 fixes the detect-don't-bundle policy.
