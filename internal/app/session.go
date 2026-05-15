@@ -281,6 +281,15 @@ func (s *Session) Close() error {
 // DroppedSamples reports samples captured but not forwarded.
 func (s *Session) DroppedSamples() uint64 { return s.drops.Load() }
 
+// CaptureHealth surfaces the underlying device's negotiated parameters.
+// Used by the UI to render BT-HFP warnings.
+func (s *Session) CaptureHealth() capture.HealthReport {
+	if s.cap == nil {
+		return capture.HealthReport{}
+	}
+	return s.cap.Health()
+}
+
 // PlaybackUnderruns reports samples the TTS playback device had to fill
 // with silence because the ringbuf was empty.
 func (s *Session) PlaybackUnderruns() uint64 {

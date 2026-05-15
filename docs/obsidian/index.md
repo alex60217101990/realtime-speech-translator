@@ -25,6 +25,7 @@ cssclasses:
 - [[architecture/Virtual Mic M4]] — M4 virtual-mic detection + guided install
 - [[architecture/UI Polish M5]] — M5 AppTabs, Models Manager, Settings, hotkey, themes
 - [[architecture/Packaging M6]] — M6 macOS .app/.dmg, Linux AppImage/.deb, Windows NSIS, CI matrix
+- [[architecture/Beta Polish M7]] — M7 logging, crash reporter, BT HFP warning, README/LICENSE
 - [[architecture/Goroutine Model]] — channels, backpressure, OS-thread locking
 - [[architecture/Cgo Boundary]] — where cgo lives, why, build implications
 
@@ -88,3 +89,4 @@ cssclasses:
 - 2026-05-15 — M4 done: [[architecture/Virtual Mic M4|internal/vmic]] enumerates BlackHole / VB-CABLE / PulseAudio null-sink across platforms; Session accepts `PlaybackDeviceID`; first-launch install wizard with OS-specific guidance and Linux auto-install via `pactl`. ADR-006 fixes the detect-don't-bundle policy.
 - 2026-05-15 — M5 done: AppTabs (Main / Models / Settings), persistent [[../../internal/config/config.go|internal/config]] YAML in XDG/AppData, [[architecture/UI Polish M5|Models Manager]] downloads manifest entries with progress bars, Settings form bound to config (theme live-applied), Cmd/Ctrl+Space hotkey toggles Start/Stop. Manifest grew to 13 Piper voices (added pt/it/zh/uk/pl/nl/tr/ja).
 - 2026-05-15 — M6 done: per-OS packaging scripts ([[../../scripts/package-macos.sh|macOS]] universal .dmg, [[../../scripts/package-linux.sh|Linux]] AppImage + .deb via nfpm, [[../../scripts/package-windows.sh|Windows]] NSIS); [[../../.github/workflows/release.yml|release.yml]] matrix on `v*` tags publishes a draft GitHub Release; build.yml now also builds native deps on every push.
+- 2026-05-15 — M7 done: [[../../internal/logging/logging.go|structured slog]] with JSON file rotation + text stderr; [[../../internal/crashreport/crashreport.go|crash reporter]] writes local `.txt` reports and re-throws; [[architecture/Beta Polish M7|capture.Health]] surfaces Bluetooth HFP degradation in the UI; README + LICENSE landed.

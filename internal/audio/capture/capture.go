@@ -134,3 +134,41 @@ func (s *Source) DroppedFrames() uint64 { return s.dropped.Load() }
 // AddDropped is exposed for Sink wrappers that wish to report overflow
 // back to the Source for metrics aggregation.
 func (s *Source) AddDropped(n uint64) { s.dropped.Add(n) }
+
+// HealthReport summarises the actual device parameters miniaudio
+// negotiated, contrasted with what we requested.
+type HealthReport struct {
+	RequestedRate     uint32
+	InternalRate      uint32
+	InternalChannels  uint32
+	InternalFormatBad bool
+	// HFPSuspect is true when the negotiated rate looks like Bluetooth
+	// HFP (8000 or 16000 Hz mono with degraded codec) — surfaces a UI
+	// warning so the user understands why audio quality dropped after
+	// the headset connected.
+	HFPSuspect bool
+}
+
+// Health reports the device's negotiated parameters. May be called any
+// time after New(); returns zero values if the device has been closed.
+func (s *Source) Health() HealthReport {
+	if s.device == nil {
+		return HealthReport{}
+	}
+	r := HealthReport{
+		RequestedRate:    s.cfg.SampleRate,
+		InternalRate:     s.device.CaptureInternalSampleRate(),
+		InternalChannels: s.device.CaptureInternalChannels(),
+	}
+	// HFP heuristic: BT headsets in HFP mode commonly negotiate
+	// 8 kHz / 16 kHz mono SCO. If the user's headset *should* be on
+	// A2DP but the mic is open, OS forces SCO and we end up here.
+	if r.InternalChannels == 1 && (r.InternalRate == 8000 || r.InternalRate == 16000) &&
+		r.InternalRate < r.RequestedRate {
+		r.HFPSuspect = true
+	}
+	if s.device.CaptureInternalFormat() != malgo.FormatS16 {
+		r.InternalFormatBad = true
+	}
+	return r
+}

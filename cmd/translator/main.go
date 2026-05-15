@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,11 +33,16 @@ import (
 
 	rstapp "github.com/alex60217101990/realtime-speech-translator/internal/app"
 	"github.com/alex60217101990/realtime-speech-translator/internal/config"
+	"github.com/alex60217101990/realtime-speech-translator/internal/crashreport"
+	"github.com/alex60217101990/realtime-speech-translator/internal/logging"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
 	"github.com/alex60217101990/realtime-speech-translator/internal/ui"
 	"github.com/alex60217101990/realtime-speech-translator/internal/vmic"
 )
+
+// version is filled in at link time via -ldflags="-X main.version=...".
+var version = "0.0.0"
 
 type voiceFlag map[string]string
 
@@ -64,9 +70,34 @@ func (f *voiceFlag) Set(s string) error {
 }
 
 func main() {
+	// Logging first so every subsequent failure is captured.
+	logClose, err := logging.Init(logging.Options{})
+	if err != nil {
+		log.Printf("logging: init failed (%v) — falling back to stderr", err)
+	} else {
+		defer func() { _ = logClose() }()
+	}
+
+	// Trim crash-report directory so it never grows unbounded.
+	_ = crashreport.Prune(20)
+
+	// Top-level panic guard. Reports are written under
+	// <data>/crash-reports/<timestamp>.txt; we rethrow so the OS still
+	// sees a non-zero exit and any supervisor restarts us.
+	defer crashreport.Recover(version,
+		func() string { return "main goroutine" },
+		func(path string, saveErr error) {
+			if saveErr != nil {
+				slog.Error("crash report save failed", "err", saveErr)
+				return
+			}
+			slog.Error("crash report written", "path", path)
+		},
+	)
+
 	saved, err := config.Load()
 	if err != nil {
-		log.Printf("config: load failed (%v) — using defaults", err)
+		slog.Warn("config load failed — using defaults", "err", err)
 		saved = config.Default()
 	}
 
@@ -99,9 +130,9 @@ func main() {
 
 	chosenDevName, chosenDevKind, missingVMic := pickPlaybackDevice(*outDevSub, &cfg)
 	if missingVMic {
-		log.Printf("vmic: no virtual mic detected — falling back to default output (preview mode)")
+		slog.Warn("no virtual mic detected — falling back to default output (preview mode)")
 	} else {
-		log.Printf("vmic: routing to %q (%s)", chosenDevName, chosenDevKind)
+		slog.Info("routing to virtual mic", "device", chosenDevName, "kind", chosenDevKind)
 	}
 
 	switch *mtBackend {
@@ -131,24 +162,39 @@ func main() {
 		pcfg.BinaryPath = *piperBin
 		peng, err := piper.New(pcfg)
 		if err != nil {
-			log.Printf("tts disabled: %v", err)
+			slog.Warn("tts disabled", "err", err)
 		} else {
 			for lang, path := range voices {
 				if err := peng.AddVoice(piper.Voice{Lang: lang, ONNXPath: path}); err != nil {
-					log.Printf("tts voice %s skipped: %v", lang, err)
+					slog.Warn("tts voice skipped", "lang", lang, "err", err)
 				}
 			}
 			if peng.HasVoice(cfg.TargetLang) {
 				cfg.TTSBackend = peng
 			} else {
-				log.Printf("tts disabled: no voice registered for target %q", cfg.TargetLang)
+				slog.Warn("tts disabled: no voice registered for target lang", "target", cfg.TargetLang)
 			}
 		}
 	}
 
 	sess, err := rstapp.New(cfg)
 	if err != nil {
+		slog.Error("session init", "err", err)
 		log.Fatalf("session init: %v", err)
+	}
+	health := sess.CaptureHealth()
+	if health.HFPSuspect {
+		slog.Warn("capture device negotiated low-rate mono — Bluetooth HFP suspected",
+			"requested_rate", health.RequestedRate,
+			"internal_rate", health.InternalRate,
+			"channels", health.InternalChannels,
+		)
+	} else {
+		slog.Info("capture device ready",
+			"requested_rate", health.RequestedRate,
+			"internal_rate", health.InternalRate,
+			"channels", health.InternalChannels,
+		)
 	}
 	defer func() {
 		if err := sess.Close(); err != nil {
@@ -239,8 +285,17 @@ func main() {
 		}
 	}()
 
+	headerBox := container.NewVBox(headerBar, statusLbl, statsLbl, startBtn)
+	if health.HFPSuspect {
+		warn := widget.NewLabel(fmt.Sprintf(
+			"⚠ Bluetooth headset is in HFP mode (mic forces %d Hz mono SCO). Speech quality may drop. Use a wired mic for best results.",
+			health.InternalRate,
+		))
+		warn.Wrapping = fyne.TextWrapWord
+		headerBox.Add(warn)
+	}
 	mainTab := container.NewBorder(
-		container.NewVBox(headerBar, statusLbl, statsLbl, startBtn),
+		headerBox,
 		nil, nil, nil,
 		container.NewGridWithColumns(2,
 			container.NewBorder(widget.NewLabel("Transcript"), nil, nil, nil, transcriptArea),
