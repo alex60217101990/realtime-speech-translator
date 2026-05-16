@@ -154,6 +154,11 @@ func main() {
 		slog.Info("routing to virtual mic", "device", chosenDevName, "kind", chosenDevKind)
 	}
 
+	// MT backend init is best-effort: a missing or broken model dir
+	// must not kill the GUI, because the only way the user can fix it
+	// (open Models tab, Re-download or switch backend) is *through*
+	// the GUI. On any init failure we log a warning, leave mtEng nil,
+	// and the application starts with translation disabled.
 	var mtEng mt.Engine
 	switch *mtBackend {
 	case "madlad":
@@ -161,12 +166,12 @@ func main() {
 		if mdir != "" && spm != "" {
 			eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(mdir, spm))
 			if err != nil {
-				slog.Error("madlad init failed", "err", err)
-				log.Fatalf("madlad: %v", err)
+				slog.Warn("MADLAD init failed — running with MT disabled; fix via Models / Settings", "err", err)
+			} else {
+				mtEng = eng
+				slog.Info("MADLAD loaded", "dir", mdir, "spm", spm,
+					"note", "quality tier — high accuracy but slow on CPU; consider m2m100 or opusmt for realtime")
 			}
-			mtEng = eng
-			slog.Info("MADLAD loaded", "dir", mdir, "spm", spm,
-				"note", "quality tier — high accuracy but slow on CPU; consider m2m100 or opusmt for realtime")
 		} else {
 			slog.Warn("MT disabled: MADLAD model not present — open the Models tab to download it")
 		}
@@ -175,12 +180,12 @@ func main() {
 		if mdir != "" && spm != "" {
 			eng, err := mt.NewM2M100(mt.DefaultM2M100Config(mdir, spm))
 			if err != nil {
-				slog.Error("m2m100 init failed", "err", err)
-				log.Fatalf("m2m100: %v", err)
+				slog.Warn("m2m100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
+			} else {
+				mtEng = eng
+				slog.Info("m2m100 loaded", "dir", mdir, "spm", spm,
+					"note", "balanced tier — 100 languages, 1-3s/utterance on CPU")
 			}
-			mtEng = eng
-			slog.Info("m2m100 loaded", "dir", mdir, "spm", spm,
-				"note", "balanced tier — 100 languages, 1-3s/utterance on CPU")
 		} else {
 			slog.Warn("MT disabled: m2m100 model not present — see README for manual install")
 		}
@@ -189,12 +194,12 @@ func main() {
 		if mdir != "" && spm != "" {
 			eng, err := mt.NewM2M100(mt.DefaultSMaLL100Config(mdir, spm))
 			if err != nil {
-				slog.Error("small100 init failed", "err", err)
-				log.Fatalf("small100: %v", err)
+				slog.Warn("small100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
+			} else {
+				mtEng = eng
+				slog.Info("SMaLL-100 loaded", "dir", mdir, "spm", spm,
+					"note", "realtime tier — 100 languages, distilled m2m100, ~330M params")
 			}
-			mtEng = eng
-			slog.Info("SMaLL-100 loaded", "dir", mdir, "spm", spm,
-				"note", "realtime tier — 100 languages, distilled m2m100, ~330M params")
 		} else {
 			slog.Warn("MT disabled: small100 model not present — see README for manual install")
 		}
@@ -208,17 +213,18 @@ func main() {
 		if root != "" {
 			eng, err := mt.NewOPUSMT(mt.DefaultOPUSMTConfig(root))
 			if err != nil {
-				log.Fatalf("opusmt: %v", err)
+				slog.Warn("opusmt init failed — running with MT disabled; fix via Models / Settings", "err", err, "root", root)
+			} else {
+				mtEng = eng
+				slog.Info("OPUS-MT loaded", "root", root,
+					"note", "realtime tier — per-pair, smallest and fastest")
 			}
-			mtEng = eng
-			slog.Info("OPUS-MT loaded", "root", root,
-				"note", "realtime tier — per-pair, smallest and fastest")
 		} else {
 			slog.Warn("MT disabled: no OPUS-MT models found — open the Models tab to download a pair")
 		}
 	case "off":
 	default:
-		log.Fatalf("unknown --mt backend: %s", *mtBackend)
+		slog.Warn("unknown --mt backend, running with MT disabled", "backend", *mtBackend)
 	}
 	var mtCache *mt.Cached
 	if mtEng != nil {
