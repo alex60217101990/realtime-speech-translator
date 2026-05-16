@@ -63,12 +63,16 @@ mt:
   # Tagging scheme differs from m2m100: the target-language tag goes
   # on the encoder side, and the decoder gets no special prefix. Our
   # m2m100 loader handles both via the TargetPrefixOnSource flag.
+  # NOTE: the upstream HuggingFace repo `alirezamshi/small100` currently
+  # returns 401 (gated / renamed), so the build-models workflow can't
+  # produce a tarball for it. Marked manual until either a working
+  # mirror is found or HF_TOKEN with access is configured. Once that's
+  # sorted, remove `manual: true` and add the GH Releases URL.
   small100-int8:
-    url: https://github.com/alex60217101990/realtime-speech-translator/releases/download/models-v1/small100-int8.tar.gz
     size_mb: 330
     backend: small100
     tier: realtime
-    archive: true
+    manual: true
 
   # Realtime tier — Helsinki-NLP OPUS-MT per-pair models would belong
   # here (~80MB / 200-500ms CPU, smallest and fastest), but the

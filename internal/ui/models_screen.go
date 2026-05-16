@@ -190,6 +190,11 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 	for _, r := range rows {
 		row := r // capture
 		statusLbl := widget.NewLabel(rowStatus(row))
+		// Long error messages (e.g. a 404 URL pasted into the status)
+		// otherwise stretch the row to many screen widths. Truncate
+		// at the label widget level so the row width stays sane and
+		// the full message remains in the slog output for diagnostics.
+		statusLbl.Truncation = fyne.TextTruncateEllipsis
 		progress := widget.NewProgressBar()
 		progress.Hide()
 		var btn *widget.Button
@@ -209,7 +214,10 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 				err := downloadRow(context.Background(), dlClient, row, progress, statusLbl)
 				fyne.Do(func() {
 					if err != nil {
-						statusLbl.SetText("error: " + err.Error())
+						// Cap the rendered error so a 200-char message
+						// (long HF URL etc.) doesn't blow out row width;
+						// the full text remains in slog for diagnosis.
+						statusLbl.SetText("error: " + truncateText(err.Error(), 80))
 					} else {
 						statusLbl.SetText(rowStatus(row))
 						btn.SetText(rowAction(row))
@@ -298,6 +306,20 @@ func rowAction(r modelRow) string {
 	return "Download"
 }
 
+// truncateText shortens s to at most max runes, appending an ellipsis
+// when truncation actually happened. Used to keep error rows from
+// blowing out the Models tab layout.
+func truncateText(s string, max int) string {
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	if max < 1 {
+		return ""
+	}
+	return string(rs[:max-1]) + "…"
+}
+
 func diskUsageSummary(rows []modelRow) string {
 	var bytes int64
 	for _, r := range rows {
@@ -328,6 +350,14 @@ func downloadRow(ctx context.Context, d *downloader.Downloader, r modelRow, bar 
 		}
 		for p := range ch {
 			updateProgress(bar, status, p)
+		}
+		// downloader.Fetch's run goroutine logs HTTP failures to
+		// stderr but does not surface them to the caller. Detect the
+		// failure here by checking whether the file actually landed —
+		// the misleading "unpack: open archive: no such file" message
+		// is what users were seeing before this guard.
+		if !paths.Exists(tmp) || paths.FileSize(tmp) == 0 {
+			return fmt.Errorf("download failed — no archive at %s (check stderr / GitHub Release for the actual HTTP status; the model may be a 404)", tmp)
 		}
 		fyne.Do(func() { status.SetText("unpacking…") })
 		if err := downloader.ExtractTarGz(tmp, r.archiveDir); err != nil {

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,12 +89,12 @@ func (d *Downloader) Fetch(ctx context.Context, url string, dstPath string, want
 		defer close(ch)
 		err := d.run(ctx, url, partPath, dstPath, want, ch)
 		if err != nil {
-			// The error is delivered by Fetch's caller via a separate
-			// goroutine that wraps Fetch; here we only log to stderr
-			// for visibility because the channel is the only return
-			// path for the goroutine and we've documented it as
-			// closing on completion.
-			fmt.Fprintf(os.Stderr, "downloader: %v\n", err)
+			// The error is not returned synchronously (the goroutine
+			// closes the Progress channel as its sole completion
+			// signal), so log it through slog with both URL and dst
+			// so the GUI's caller can verify success via file size
+			// while the operator sees the real reason in the log.
+			slog.Error("downloader failed", "url", url, "dst", dstPath, "err", err)
 		}
 	}()
 
