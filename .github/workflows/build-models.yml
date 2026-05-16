@@ -8,14 +8,21 @@
 #
 # Inputs:
 #   release_tag   target tag for the release assets (default: models-v1)
-#   models        space-separated list of manifest keys to build
-#                 (default: m2m100-418m-int8 small100-int8)
+#   models        space-separated list of manifest keys to build.
+#                 Default is m2m100-418m-int8 only — small100 / opusmt
+#                 entries require a working HF mirror; opt them in
+#                 explicitly when the upstream is healthy.
 #
-# Why a clean Linux runner: the Python / PyTorch / CTranslate2 stack
-# the converter needs is finicky on macOS x86 (NumPy ABI mismatches,
-# torch wheels capped at 2.2.2, transformers requiring 2.4+, segfaults).
-# Running it once in GitHub's Ubuntu image avoids that entirely; users
-# only download the resulting .tar.gz.
+# Caches:
+#   - pip wheel cache (actions/setup-python cache: pip), keyed on
+#     this workflow file.
+#   - HuggingFace hub cache (~/.cache/huggingface) so re-runs skip
+#     the 1-2 GB model download.
+#
+# Failure policy: each model is built in its own loop iteration. A
+# 4xx/5xx from HF on one model is logged as ::error:: but does not
+# abort the others; the job exits non-zero only if every requested
+# model failed.
 
 name: build-models
 
@@ -27,9 +34,9 @@ on:
         required: true
         default: "models-v1"
       models:
-        description: "Space-separated manifest keys"
+        description: "Space-separated manifest keys (m2m100-418m-int8 | small100-int8 | opusmt-ru-en | opusmt-en-ru)"
         required: true
-        default: "m2m100-418m-int8 small100-int8"
+        default: "m2m100-418m-int8"
 
 permissions:
   contents: write  # needed to create / update the Release
@@ -49,6 +56,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          # Re-key the pip cache only when this workflow's pinned
+          # versions change; the file itself is the dependency
+          # declaration since there's no requirements.txt.
+          cache-dependency-path: .github/workflows/build-models.yml
+
+      - name: Cache HuggingFace hub
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          # Model bytes are the same regardless of workflow version —
+          # only the *set* of requested models matters. Key on that
+          # and fall back to any previous hub cache for partial reuse.
+          key: hf-${{ runner.os }}-${{ hashFiles('.github/workflows/build-models.yml') }}-${{ github.event.inputs.models }}
+          restore-keys: |
+            hf-${{ runner.os }}-${{ hashFiles('.github/workflows/build-models.yml') }}-
+            hf-${{ runner.os }}-
 
       - name: Install converter toolchain
         run: |
@@ -68,13 +92,19 @@ jobs:
 
       - name: Convert models
         env:
-          # Optional: set a HF_TOKEN repo secret to pull gated models
-          # (e.g. some Helsinki-NLP variants). Public models work
+          # Optional: set a HF_TOKEN repo secret (Settings -> Secrets ->
+          # Actions) to pull gated / renamed models. Public models work
           # without it.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p out
+
+          # If a token is present, log into the HF cache so every
+          # subsequent transformer download picks it up automatically.
+          if [[ -n "${HF_TOKEN:-}" ]]; then
+            python -c "from huggingface_hub import login; import os; login(os.environ['HF_TOKEN'])"
+          fi
 
           convert_m2m100() {
             local out_dir="$1"
@@ -90,7 +120,7 @@ jobs:
           convert_opusmt() {
             local out_dir="$1"
             local hf_model="$2"
-            # Marian models ship source.spm + target.spm + vocab.yml
+            # Marian models ship source.spm + target.spm + vocab.json
             # instead of a single sentencepiece file.
             ct2-transformers-converter \
               --model "$hf_model" \
@@ -100,23 +130,48 @@ jobs:
             tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
           }
 
+          # Each iteration runs in a subshell with errors trapped, so
+          # one HF 401/404 doesn't cascade into the rest.
+          ok_count=0
+          fail_count=0
           for key in $MODELS; do
-            case "$key" in
-              m2m100-418m-int8)
-                convert_m2m100 m2m100-418m-int8 facebook/m2m100_418M ;;
-              small100-int8)
-                convert_m2m100 small100-int8 alirezamshi/small100 ;;
-              opusmt-ru-en)
-                convert_opusmt opusmt-ru-en Helsinki-NLP/opus-mt-ru-en ;;
-              opusmt-en-ru)
-                convert_opusmt opusmt-en-ru Helsinki-NLP/opus-mt-en-ru ;;
-              *)
-                echo "::error::unknown model key: $key"
-                exit 1 ;;
-            esac
+            echo "::group::Build $key"
+            (
+              set -e
+              case "$key" in
+                m2m100-418m-int8)
+                  convert_m2m100 m2m100-418m-int8 facebook/m2m100_418M ;;
+                small100-int8)
+                  convert_m2m100 small100-int8 alirezamshi/small100 ;;
+                opusmt-ru-en)
+                  convert_opusmt opusmt-ru-en Helsinki-NLP/opus-mt-ru-en ;;
+                opusmt-en-ru)
+                  convert_opusmt opusmt-en-ru Helsinki-NLP/opus-mt-en-ru ;;
+                *)
+                  echo "::error::unknown model key: $key"
+                  exit 1 ;;
+              esac
+            )
+            rc=$?
+            echo "::endgroup::"
+            if [[ $rc -eq 0 ]]; then
+              ok_count=$((ok_count + 1))
+              echo "::notice::$key built ok"
+            else
+              fail_count=$((fail_count + 1))
+              echo "::error::$key failed with exit $rc — likely HF 401/404. Set HF_TOKEN secret if the upstream is gated, or remove $key from the models input."
+            fi
           done
 
-          ls -lh out/*.tar.gz
+          echo ""
+          echo "Summary: $ok_count built, $fail_count failed"
+          ls -lh out/*.tar.gz 2>/dev/null || true
+
+          # Bail only if nothing was produced — partial success is fine.
+          if [[ $ok_count -eq 0 ]]; then
+            echo "::error::No models built — nothing to upload"
+            exit 1
+          fi
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
@@ -131,4 +186,4 @@ jobs:
           files: |
             out/*.tar.gz
           generate_release_notes: false
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
