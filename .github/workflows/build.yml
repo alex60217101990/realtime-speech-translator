@@ -54,8 +54,12 @@ jobs:
       - name: Vet
         run: make vet
 
+      # Routed through make so the cgo env (CPATH / LIBRARY_PATH /
+      # CGO_CXXFLAGS) exported by the Makefile is in scope — otherwise
+      # `go test` cannot resolve whisper.h / ctranslate2 / sentencepiece
+      # headers and every cgo-touching package fails to build.
       - name: Test
-        run: go test -race ./...
+        run: make test-race
 
       - name: Build
         run: make build
