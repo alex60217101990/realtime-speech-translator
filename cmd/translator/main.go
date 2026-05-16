@@ -706,6 +706,12 @@ func resolveModelPath(flagVal, whisperName string) (string, error) {
 // for a MADLAD-style backend (one model + one tokenizer alongside).
 // CLI flags win; otherwise we look under the platform data dir the
 // Models tab populated (paths.MTDir(<manifestKey>)).
+//
+// spmFilename is the *preferred* tokenizer filename; if it's missing
+// we also try a small list of fallbacks ("sentencepiece.model",
+// "sentencepiece.bpe.model", "tokenizer.model") because the
+// ct2-transformers-converter output and various HF mirrors disagree
+// on which name to use.
 func resolveCT2Model(flagDir, flagSPM, manifestKey, spmFilename string) (dir, spm string) {
 	dir, spm = flagDir, flagSPM
 	if dir != "" && spm != "" {
@@ -719,9 +725,18 @@ func resolveCT2Model(flagDir, flagSPM, manifestKey, spmFilename string) (dir, sp
 		dir = defaultDir
 	}
 	if spm == "" {
-		cand := filepath.Join(defaultDir, spmFilename)
-		if paths.Exists(cand) {
-			spm = cand
+		candidates := []string{spmFilename, "sentencepiece.bpe.model", "sentencepiece.model", "tokenizer.model"}
+		seen := map[string]bool{}
+		for _, name := range candidates {
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			cand := filepath.Join(defaultDir, name)
+			if paths.Exists(cand) {
+				spm = cand
+				break
+			}
 		}
 	}
 	return

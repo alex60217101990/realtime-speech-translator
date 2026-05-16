@@ -106,15 +106,38 @@ jobs:
             python -c "from huggingface_hub import login; import os; login(os.environ['HF_TOKEN'])"
           fi
 
+          # Common helper to bake a tarball and report its contents.
+          # Logging the directory listing before tar makes it obvious
+          # when a vocab file is missing (CT2 fails at runtime with
+          # "Cannot load the target vocabulary" otherwise).
+          finalise() {
+            local out_dir="$1"
+            echo "::group::Contents of out/$out_dir"
+            ls -la "out/$out_dir"
+            echo "::endgroup::"
+            tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
+            echo "::notice::built out/${out_dir}.tar.gz ($(du -h "out/${out_dir}.tar.gz" | cut -f1))"
+          }
+
           convert_m2m100() {
             local out_dir="$1"
             local hf_model="$2"
+            # vocab.json carries the integer-token table CT2 needs at
+            # load time; ct2-transformers-converter does not regenerate
+            # it for m2m100, so we must request it explicitly.
+            # sentencepiece.bpe.model is the BPE tokenizer used at
+            # runtime by our Go SentencePiece wrapper.
             ct2-transformers-converter \
+              --force \
               --model "$hf_model" \
               --output_dir "out/$out_dir" \
               --quantization int8 \
-              --copy_files tokenizer_config.json special_tokens_map.json sentencepiece.bpe.model
-            tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
+              --copy_files \
+                tokenizer_config.json \
+                special_tokens_map.json \
+                sentencepiece.bpe.model \
+                vocab.json
+            finalise "$out_dir"
           }
 
           convert_opusmt() {
@@ -123,11 +146,12 @@ jobs:
             # Marian models ship source.spm + target.spm + vocab.json
             # instead of a single sentencepiece file.
             ct2-transformers-converter \
+              --force \
               --model "$hf_model" \
               --output_dir "out/$out_dir" \
               --quantization int8 \
               --copy_files tokenizer_config.json source.spm target.spm vocab.json
-            tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
+            finalise "$out_dir"
           }
 
           # Each iteration runs in a subshell with errors trapped, so
