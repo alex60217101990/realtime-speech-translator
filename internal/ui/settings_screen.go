@@ -35,17 +35,31 @@ func SettingsScreen(w fyne.Window, cur config.Settings, cb SettingsCallbacks) fy
 	form.Append("Target language", dstEntry)
 
 	whisperSel := widget.NewSelect(
-		[]string{"tiny", "base", "small", "medium", "large"},
+		[]string{
+			"tiny  (realtime ★)",
+			"base  (realtime ★)",
+			"small (balanced)",
+			"medium (quality)",
+			"large (quality)",
+		},
 		nil,
 	)
-	whisperSel.SetSelected(cur.WhisperModel)
+	// Persisted config holds the bare model name; render the badge
+	// in the dropdown for the UI but normalise back on save.
+	whisperSel.SetSelected(decorateWhisper(cur.WhisperModel))
 	form.Append("Whisper model", whisperSel)
 
 	mtSel := widget.NewSelect(
-		[]string{"madlad", "opusmt", "off"},
+		[]string{
+			"small100 (realtime ★ — distilled m2m100, 330M)",
+			"opusmt   (realtime ★ — fastest per-pair)",
+			"m2m100   (balanced — 100 languages, 418M)",
+			"madlad   (quality — slow on CPU)",
+			"off",
+		},
 		nil,
 	)
-	mtSel.SetSelected(cur.MTBackend)
+	mtSel.SetSelected(decorateMT(cur.MTBackend))
 	form.Append("MT backend", mtSel)
 
 	threadsEntry := widget.NewEntry()
@@ -90,8 +104,8 @@ func SettingsScreen(w fyne.Window, cur config.Settings, cb SettingsCallbacks) fy
 		s := config.Settings{
 			SourceLang:        srcEntry.Text,
 			TargetLang:        dstEntry.Text,
-			WhisperModel:      whisperSel.Selected,
-			MTBackend:         mtSel.Selected,
+			WhisperModel:      undecorate(whisperSel.Selected),
+			MTBackend:         undecorate(mtSel.Selected),
 			Threads:           parseInt(threadsEntry.Text, cur.Threads),
 			VADAggressiveness: int(vadSlider.Value),
 			OutputDevice:      outDevEntry.Text,
@@ -123,4 +137,50 @@ func parseInt(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+// undecorate returns the first whitespace-delimited token of a Select
+// option, i.e. strips the trailing tier annotation ("base  (realtime
+// ★)" -> "base"). Keeps config.Settings free of UI noise.
+func undecorate(s string) string {
+	for i, r := range s {
+		if r == ' ' || r == '\t' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// decorateWhisper returns the dropdown label that matches a stored
+// Whisper model name; falls back to the raw value if the persisted
+// option no longer exists in the list.
+func decorateWhisper(name string) string {
+	for _, opt := range []string{
+		"tiny  (realtime ★)",
+		"base  (realtime ★)",
+		"small (balanced)",
+		"medium (quality)",
+		"large (quality)",
+	} {
+		if undecorate(opt) == name {
+			return opt
+		}
+	}
+	return name
+}
+
+// decorateMT mirrors decorateWhisper for the MT backend selector.
+func decorateMT(name string) string {
+	for _, opt := range []string{
+		"small100 (realtime ★ — distilled m2m100, 330M)",
+		"opusmt   (realtime ★ — fastest per-pair)",
+		"m2m100   (balanced — 100 languages, 418M)",
+		"madlad   (quality — slow on CPU)",
+		"off",
+	} {
+		if undecorate(opt) == name {
+			return opt
+		}
+	}
+	return name
 }

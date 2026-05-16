@@ -164,7 +164,7 @@ func TestFetchContextCancel(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		// Slow drip — never finishes within the cancel window.
 		buf := make([]byte, 1024)
-		for i := 0; i < 1024; i++ {
+		for range 1024 {
 			if _, err := w.Write(buf); err != nil {
 				return
 			}

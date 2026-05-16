@@ -1,0 +1,134 @@
+# Manually-triggered model build pipeline.
+#
+# Converts source HuggingFace checkpoints (PyTorch / Marian) into
+# CTranslate2 int8 exports inside a clean Linux container, tarballs
+# them, and uploads each as an asset on the chosen GitHub Release.
+#
+# Trigger: Actions tab -> "build-models" -> Run workflow.
+#
+# Inputs:
+#   release_tag   target tag for the release assets (default: models-v1)
+#   models        space-separated list of manifest keys to build
+#                 (default: m2m100-418m-int8 small100-int8)
+#
+# Why a clean Linux runner: the Python / PyTorch / CTranslate2 stack
+# the converter needs is finicky on macOS x86 (NumPy ABI mismatches,
+# torch wheels capped at 2.2.2, transformers requiring 2.4+, segfaults).
+# Running it once in GitHub's Ubuntu image avoids that entirely; users
+# only download the resulting .tar.gz.
+
+name: build-models
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to attach assets to"
+        required: true
+        default: "models-v1"
+      models:
+        description: "Space-separated manifest keys"
+        required: true
+        default: "m2m100-418m-int8 small100-int8"
+
+permissions:
+  contents: write  # needed to create / update the Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+      MODELS:      ${{ github.event.inputs.models }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install converter toolchain
+        run: |
+          python -m pip install --upgrade pip
+          # Versions pinned to the combination that actually works
+          # together. torch 2.2.2 is the last x86-friendly release;
+          # transformers 4.36 + ctranslate2 4.3.1 is the known-good
+          # pairing for m2m100 / OPUS-MT / SMaLL-100 conversion.
+          pip install --only-binary=:all: \
+            'numpy<2' \
+            'torch==2.2.2' \
+            'transformers==4.36.2' \
+            'ctranslate2==4.3.1' \
+            'sentencepiece' \
+            'protobuf<5' \
+            'sacremoses'   # required by MarianTokenizer (OPUS-MT)
+
+      - name: Convert models
+        env:
+          # Optional: set a HF_TOKEN repo secret to pull gated models
+          # (e.g. some Helsinki-NLP variants). Public models work
+          # without it.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          convert_m2m100() {
+            local out_dir="$1"
+            local hf_model="$2"
+            ct2-transformers-converter \
+              --model "$hf_model" \
+              --output_dir "out/$out_dir" \
+              --quantization int8 \
+              --copy_files tokenizer_config.json special_tokens_map.json sentencepiece.bpe.model
+            tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
+          }
+
+          convert_opusmt() {
+            local out_dir="$1"
+            local hf_model="$2"
+            # Marian models ship source.spm + target.spm + vocab.yml
+            # instead of a single sentencepiece file.
+            ct2-transformers-converter \
+              --model "$hf_model" \
+              --output_dir "out/$out_dir" \
+              --quantization int8 \
+              --copy_files tokenizer_config.json source.spm target.spm vocab.json
+            tar -C out -czf "out/${out_dir}.tar.gz" "$out_dir"
+          }
+
+          for key in $MODELS; do
+            case "$key" in
+              m2m100-418m-int8)
+                convert_m2m100 m2m100-418m-int8 facebook/m2m100_418M ;;
+              small100-int8)
+                convert_m2m100 small100-int8 alirezamshi/small100 ;;
+              opusmt-ru-en)
+                convert_opusmt opusmt-ru-en Helsinki-NLP/opus-mt-ru-en ;;
+              opusmt-en-ru)
+                convert_opusmt opusmt-en-ru Helsinki-NLP/opus-mt-en-ru ;;
+              *)
+                echo "::error::unknown model key: $key"
+                exit 1 ;;
+            esac
+          done
+
+          ls -lh out/*.tar.gz
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Pre-built CT2 models (${{ env.RELEASE_TAG }})"
+          body: |
+            Pre-built CTranslate2 int8 exports — produced by the
+            `build-models` workflow. The application's Models Manager
+            pulls these directly; users do not need Python or any ML
+            toolchain to install them.
+          files: |
+            out/*.tar.gz
+          generate_release_notes: false
+          fail_on_unmatched_files: true

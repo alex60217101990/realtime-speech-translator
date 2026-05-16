@@ -90,11 +90,8 @@ func TestSPSCConcurrent(t *testing.T) {
 		buf := make([]int16, 128)
 		var sent uint64
 		for sent < total {
-			n := uint64(len(buf))
-			if total-sent < n {
-				n = total - sent
-			}
-			for i := uint64(0); i < n; i++ {
+			n := min(total-sent, uint64(len(buf)))
+			for i := range n {
 				buf[i] = int16(sent + i)
 			}
 			for written := 0; written < int(n); {
@@ -115,7 +112,7 @@ func TestSPSCConcurrent(t *testing.T) {
 		var got uint64
 		for got < total {
 			n := r.Read(buf)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				want := int16(got + uint64(i))
 				if buf[i] != want {
 					t.Errorf("seq mismatch at %d: got %d want %d", got+uint64(i), buf[i], want)

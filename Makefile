@@ -95,6 +95,13 @@ test-race:
 vet:
 	$(GO) vet $(PKG)
 
+# go fix needs the same cgo env (CPATH, LIBRARY_PATH, …) as build, since
+# fix walks the AST per package and bails on cgo packages whose headers
+# it can't resolve. Run it via this target rather than `go fix` in a
+# bare shell.
+fix:
+	$(GO) fix $(PKG)
+
 bench:
 	$(GO) test -bench=. -benchmem -run=^$$ $(PKG)
 

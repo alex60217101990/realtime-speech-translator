@@ -54,7 +54,7 @@ func TestSaveAndList(t *testing.T) {
 
 func TestPrune(t *testing.T) {
 	withTempData(t)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if _, err := Save("v0", "s", "boom"); err != nil {
 			t.Fatal(err)
 		}

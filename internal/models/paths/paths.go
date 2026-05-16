@@ -117,6 +117,45 @@ func MTDir(name string) (string, error) {
 	return dir, nil
 }
 
+// OPUSMTPair returns the directory for a single OPUS-MT language pair
+// (e.g. "ru-en"). It lives under mt/opusmt/<pair>/ so the OPUS-MT
+// loader can discover every downloaded pair by listing one parent.
+func OPUSMTPair(pair string) (string, error) {
+	if pair == "" {
+		return "", errors.New("paths: empty OPUS-MT pair")
+	}
+	m, err := Models()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(m, "mt", "opusmt", pair)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// OPUSMTRoot returns the root for OPUS-MT pair downloads, used by the
+// loader to enumerate available pairs.
+func OPUSMTRoot() (string, error) {
+	m, err := Models()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(m, "mt", "opusmt"), nil
+}
+
+// TranslationMemory returns the path of the persistent translation
+// memory JSON file. The parent dir is the application data root
+// (created by callers via os.MkdirAll on first save).
+func TranslationMemory() (string, error) {
+	d, err := Data()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "translation_memory.json"), nil
+}
+
 // TTSVoice returns the local file path for a Piper voice .onnx; the
 // sibling .onnx.json is at TTSVoiceJSON(name). The directory is created
 // on demand; the files may or may not exist.

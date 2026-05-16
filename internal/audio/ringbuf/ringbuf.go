@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	ErrSizeNotPow2 = errors.New("ringbuf: capacity must be a power of two")
+	ErrSizeNotPow2  = errors.New("ringbuf: capacity must be a power of two")
 	ErrSizeTooSmall = errors.New("ringbuf: capacity must be >= 2")
 )
 
@@ -63,19 +63,13 @@ func (r *Ring) Write(p []int16) int {
 	head := r.head.Load()
 	tail := r.tail.Load()
 	free := uint64(len(r.buf)) - (head - tail)
-	n := uint64(len(p))
-	if n > free {
-		n = free
-	}
+	n := min(uint64(len(p)), free)
 	if n == 0 {
 		return 0
 	}
 	// Possibly two segments if write wraps around.
 	idx := head & r.mask
-	first := uint64(len(r.buf)) - idx
-	if first > n {
-		first = n
-	}
+	first := min(uint64(len(r.buf))-idx, n)
 	copy(r.buf[idx:idx+first], p[:first])
 	if rem := n - first; rem > 0 {
 		copy(r.buf[:rem], p[first:n])
@@ -92,18 +86,12 @@ func (r *Ring) Read(p []int16) int {
 	head := r.head.Load()
 	tail := r.tail.Load()
 	avail := head - tail
-	n := uint64(len(p))
-	if n > avail {
-		n = avail
-	}
+	n := min(uint64(len(p)), avail)
 	if n == 0 {
 		return 0
 	}
 	idx := tail & r.mask
-	first := uint64(len(r.buf)) - idx
-	if first > n {
-		first = n
-	}
+	first := min(uint64(len(r.buf))-idx, n)
 	copy(p[:first], r.buf[idx:idx+first])
 	if rem := n - first; rem > 0 {
 		copy(p[first:n], r.buf[:rem])

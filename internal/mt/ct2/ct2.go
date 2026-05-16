@@ -59,6 +59,12 @@ type Translator struct {
 }
 
 // New loads a CTranslate2 model directory.
+//
+// When opts.Threads is 0 we resolve it to runtime.NumCPU() rather than
+// leaving the "auto" default, because CTranslate2's auto-detect is
+// conservative on x86 macOS and was leaving cores idle during MADLAD
+// 3B int8 inference — the single biggest contributor to perceived lag
+// on this stack.
 func New(modelDir string, opts Options) (*Translator, error) {
 	cdir := C.CString(modelDir)
 	defer C.free(unsafe.Pointer(cdir))
@@ -66,8 +72,12 @@ func New(modelDir string, opts Options) (*Translator, error) {
 	cct := C.CString(string(opts.ComputeType))
 	defer C.free(unsafe.Pointer(cct))
 
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = runtime.NumCPU()
+	}
 	var cerr *C.char
-	h := C.ct2_new(cdir, cct, C.int32_t(opts.Threads), &cerr)
+	h := C.ct2_new(cdir, cct, C.int32_t(threads), &cerr)
 	if h == nil {
 		msg := "ct2: load failed"
 		if cerr != nil {

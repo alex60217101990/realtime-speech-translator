@@ -27,10 +27,10 @@ import (
 
 // Transcript is the result of processing one utterance of PCM.
 type Transcript struct {
-	Text      string
-	Language  string        // detected or configured source language code
-	Latency   time.Duration // wall time spent in Engine.Transcribe
-	Segments  []Segment
+	Text     string
+	Language string        // detected or configured source language code
+	Latency  time.Duration // wall time spent in Engine.Transcribe
+	Segments []Segment
 }
 
 // Segment is a single timestamped chunk of recognised speech. The
@@ -54,7 +54,10 @@ type Config struct {
 	Translate bool
 
 	// Threads caps the number of inference threads. Zero means
-	// runtime.NumCPU()/2 — leaves room for the audio thread.
+	// runtime.NumCPU()-1 (clamped to ≥1) — leaves one core for the
+	// audio thread + UI but otherwise gives Whisper everything we have,
+	// because Transcribe is the single biggest contributor to perceived
+	// latency.
 	Threads int
 
 	// BeamSize chooses greedy (1) vs beam search (>1). 1 keeps latency
@@ -146,10 +149,7 @@ func (e *Engine) Transcribe(pcm []int16, override *Config) (*Transcript, error) 
 		cfg = mergeConfig(cfg, *override)
 	}
 	if cfg.Threads == 0 {
-		t := runtime.NumCPU() / 2
-		if t < 1 {
-			t = 1
-		}
+		t := max(runtime.NumCPU()-1, 1)
 		cfg.Threads = t
 	}
 

@@ -23,6 +23,7 @@ type modelRow struct {
 	kind      string // "whisper" / "tts" / "mt"
 	label     string
 	sizeMB    int
+	tier      manifest.Tier
 	url       string
 	sha256    string
 	localPath string
@@ -31,6 +32,19 @@ type modelRow struct {
 	// upstream HF mirrors do not publish per-file SHA256). Used by MT
 	// rows (config.json + sentencepiece.model) and TTS rows (.onnx.json).
 	extras []extraFile
+
+	// manual marks entries the application can't download automatically
+	// — typically because the upstream CT2 mirror is gated or missing.
+	// The UI replaces the Download button with a disabled "Manual
+	// install" hint pointing at the README.
+	manual bool
+
+	// archive switches the download flow into "fetch one tarball,
+	// unpack into the model directory" mode. archiveDir is the
+	// extraction target; localPath is recomputed as
+	// archiveDir + "/model.bin" so the existing installed-check works.
+	archive    bool
+	archiveDir string
 }
 
 type extraFile struct {
@@ -61,13 +75,22 @@ func gatherRows(m *manifest.File) []modelRow {
 			kind:      "whisper",
 			label:     "Whisper " + name,
 			sizeMB:    w.SizeMB,
+			tier:      w.Tier,
 			url:       w.URL,
 			sha256:    w.SHA256,
 			localPath: p,
 		})
 	}
 	for name, mt := range m.MT {
-		dir, _ := paths.MTDir(name)
+		// OPUS-MT models live under mt/opusmt/<pair>/ so the loader can
+		// enumerate every downloaded pair from a single root. MADLAD /
+		// m2m100 keep the legacy mt/<name>/ layout.
+		var dir string
+		if mt.Backend == "opusmt" && mt.Pair != "" {
+			dir, _ = paths.OPUSMTPair(mt.Pair)
+		} else {
+			dir, _ = paths.MTDir(name)
+		}
 		extras := []extraFile{}
 		if mt.ConfigURL != "" {
 			extras = append(extras, extraFile{
@@ -75,24 +98,61 @@ func gatherRows(m *manifest.File) []modelRow {
 				localPath: filepath.Join(dir, "config.json"),
 			})
 		}
-		if mt.TokenizerURL != "" {
+		if mt.VocabURL != "" {
+			vocabName := mt.VocabName
+			if vocabName == "" {
+				vocabName = "shared_vocabulary.json"
+			}
 			extras = append(extras, extraFile{
-				url:       mt.TokenizerURL,
-				localPath: filepath.Join(dir, "sentencepiece.model"),
+				url:       mt.VocabURL,
+				localPath: filepath.Join(dir, vocabName),
 			})
 		}
-		rows = append(rows, modelRow{
+		if mt.TokenizerURL != "" {
+			// OPUS-MT publishes source.spm / target.spm rather than the
+			// single sentencepiece.model used by MADLAD / m2m100. We
+			// keep both filenames so loaders can pick the right one by
+			// inspecting which exists.
+			spmName := "sentencepiece.model"
+			if mt.Backend == "opusmt" {
+				spmName = "source.spm"
+			}
+			extras = append(extras, extraFile{
+				url:       mt.TokenizerURL,
+				localPath: filepath.Join(dir, spmName),
+			})
+		}
+		if mt.Tokenizer2URL != "" {
+			extras = append(extras, extraFile{
+				url:       mt.Tokenizer2URL,
+				localPath: filepath.Join(dir, "target.spm"),
+			})
+		}
+		row := modelRow{
 			id:        name,
 			kind:      "mt",
 			label:     "MT " + name,
 			sizeMB:    mt.SizeMB,
+			tier:      mt.Tier,
 			url:       mt.URL,
 			sha256:    mt.SHA256,
+			manual:    mt.Manual,
+			archive:   mt.Archive,
 			// model.bin is the canonical "installed" marker; extras
-			// (config.json, sentencepiece.model) are checked alongside.
+			// (config.json + shared_vocabulary.json + sentencepiece.model)
+			// are checked alongside so an incomplete download lights the
+			// "missing" badge instead of silently failing at runtime.
 			localPath: filepath.Join(dir, "model.bin"),
 			extras:    extras,
-		})
+		}
+		if mt.Archive {
+			// Archive entries fetch a single .tar.gz which is unpacked
+			// into the MT model directory. There are no per-file extras
+			// because the tarball already contains everything.
+			row.archiveDir = dir
+			row.extras = nil
+		}
+		rows = append(rows, row)
 	}
 	for name, v := range m.TTS {
 		p, _ := paths.TTSVoice(name)
@@ -137,6 +197,12 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 			if row.installed() {
 				return // delete-flow lives in M6
 			}
+			if row.manual {
+				// No reliable mirror — point at the README and let the
+				// user convert + copy manually. Doing nothing here is
+				// the right action; the row label already explains.
+				return
+			}
 			btn.Disable()
 			progress.Show()
 			go func() {
@@ -153,6 +219,9 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 				})
 			}()
 		})
+		if row.manual && !row.installed() {
+			btn.Disable()
+		}
 
 		mu.Lock()
 		progressByRow[row.id] = progress
@@ -189,19 +258,42 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 }
 
 func rowStatus(r modelRow) string {
+	badge := tierBadge(r.tier)
 	if !r.installed() {
-		return fmt.Sprintf("missing (%d MB)", r.sizeMB)
+		if r.manual {
+			return fmt.Sprintf("%smanual install — see README (~%d MB)", badge, r.sizeMB)
+		}
+		return fmt.Sprintf("%smissing (%d MB)", badge, r.sizeMB)
 	}
 	size := paths.FileSize(r.localPath)
 	for _, e := range r.extras {
 		size += paths.FileSize(e.localPath)
 	}
-	return fmt.Sprintf("installed (%d MB)", size>>20)
+	return fmt.Sprintf("%sinstalled (%d MB)", badge, size>>20)
+}
+
+// tierBadge renders a short tier prefix shown next to every model row.
+// Realtime entries are marked first so the eye lands on them, since
+// they are the ones the application actually recommends for live use.
+func tierBadge(t manifest.Tier) string {
+	switch t {
+	case manifest.TierRealtime:
+		return "[REALTIME ★]  "
+	case manifest.TierBalanced:
+		return "[balanced]    "
+	case manifest.TierQuality:
+		return "[quality]     "
+	default:
+		return ""
+	}
 }
 
 func rowAction(r modelRow) string {
 	if r.installed() {
 		return "Re-download"
+	}
+	if r.manual {
+		return "Manual install"
 	}
 	return "Download"
 }
@@ -224,6 +316,31 @@ func downloadRow(ctx context.Context, d *downloader.Downloader, r modelRow, bar 
 	if r.url == "" {
 		return fmt.Errorf("no URL")
 	}
+
+	if r.archive {
+		// Archive flow: fetch a single .tar.gz into a tmp path,
+		// unpack into archiveDir, drop the tarball afterwards. Saves
+		// the user from the Python+torch+ctranslate2 toolchain entirely.
+		tmp := filepath.Join(r.archiveDir, "_download.tar.gz")
+		ch, err := d.Fetch(ctx, r.url, tmp, r.sha256)
+		if err != nil {
+			return err
+		}
+		for p := range ch {
+			updateProgress(bar, status, p)
+		}
+		fyne.Do(func() { status.SetText("unpacking…") })
+		if err := downloader.ExtractTarGz(tmp, r.archiveDir); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("unpack: %w", err)
+		}
+		_ = os.Remove(tmp)
+		if !paths.Exists(r.localPath) || paths.FileSize(r.localPath) == 0 {
+			return fmt.Errorf("unpack finished but %s is missing", r.localPath)
+		}
+		return nil
+	}
+
 	ch, err := d.Fetch(ctx, r.url, r.localPath, r.sha256)
 	if err != nil {
 		return err

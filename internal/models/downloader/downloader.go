@@ -30,6 +30,12 @@ type Downloader struct {
 	Client    *http.Client
 	UserAgent string
 
+	// BearerToken, when non-empty, is sent as "Authorization: Bearer …"
+	// on every request. Used to unlock gated HuggingFace repos: set
+	// HF_TOKEN in the environment and the downloader will fetch
+	// previously 401-ing models. Always logged with token redacted.
+	BearerToken string
+
 	// MaxAttempts caps the number of retries. Zero means 5.
 	MaxAttempts int
 
@@ -42,13 +48,17 @@ type Downloader struct {
 	ProgressInterval time.Duration
 }
 
-// New returns a Downloader with sensible defaults.
+// New returns a Downloader with sensible defaults. It honours the
+// HF_TOKEN environment variable so gated HuggingFace repos can be
+// downloaded without code changes — the user only has to export the
+// token in their shell (or via Settings) before launching.
 func New() *Downloader {
 	return &Downloader{
 		Client: &http.Client{
 			Timeout: 0, // streaming; rely on context cancellation
 		},
 		UserAgent:        "realtime-speech-translator/0.1 (+downloader)",
+		BearerToken:      os.Getenv("HF_TOKEN"),
 		MaxAttempts:      5,
 		InitialBackoff:   time.Second,
 		ProgressInterval: 250 * time.Millisecond,
@@ -148,6 +158,9 @@ func (d *Downloader) attempt(ctx context.Context, url, partPath string, ch chan<
 	if d.UserAgent != "" {
 		req.Header.Set("User-Agent", d.UserAgent)
 	}
+	if d.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+d.BearerToken)
+	}
 	if startOffset > 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(startOffset, 10)+"-")
 	}
@@ -172,7 +185,15 @@ func (d *Downloader) attempt(ctx context.Context, url, partPath string, ch chan<
 		// already complete; let the hash verifier decide.
 		return nil
 	default:
-		return fmt.Errorf("downloader: HTTP %d", resp.StatusCode)
+		// Include the URL so the user can see WHICH file failed when a
+		// multi-file model (model.bin + config.json + spm + vocab) only
+		// partly resolves on the mirror. Most upstream 404s mean the
+		// repo renamed a file or the mirror is stale.
+		hint := ""
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			hint = " (gated repo — set HF_TOKEN to authenticate)"
+		}
+		return fmt.Errorf("downloader: HTTP %d for %s%s", resp.StatusCode, url, hint)
 	}
 
 	total := startOffset + resp.ContentLength

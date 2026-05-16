@@ -30,11 +30,45 @@ On first launch:
 1. The application enumerates audio devices and looks for a virtual mic
    (BlackHole on macOS, VB-CABLE on Windows, PulseAudio null-sink on Linux).
    If none is present, a wizard walks you through installing the right one.
-2. Open the **Models** tab and download the default set (Whisper-small,
-   MADLAD-400-3B, a Piper voice for your target language). Each row in
-   the Models Manager downloads everything that engine needs (e.g. MT
-   rows fetch `model.bin` + `config.json` + `sentencepiece.model` in one
-   shot). All files land in the per-OS data directory.
+2. Open the **Models** tab and download the default set. The Models
+   Manager shows a **tier badge** on every row:
+   - `[REALTIME ★]` — recommended for live translation (Whisper base/tiny,
+     OPUS-MT — if you install one manually).
+   - `[balanced]` — Whisper small, m2m100-418m (good default if you don't
+     have an OPUS-MT model handy).
+   - `[quality]` — Whisper medium/large, MADLAD-400-3B (heavy on CPU,
+     better used for offline batch).
+
+   Each row downloads everything that engine needs (e.g. MT rows fetch
+   `model.bin` + `config.json` + `sentencepiece.model` in one shot).
+   All files land in the per-OS data directory.
+
+   `<data>` resolves to `~/Library/Application Support/realtime-speech-translator`
+   on macOS, `%LOCALAPPDATA%\realtime-speech-translator` on Windows,
+   `$XDG_DATA_HOME/realtime-speech-translator` on Linux.
+
+### Pre-built MT models (`m2m100`, `small100`, `opusmt`)
+
+The MT backends other than MADLAD ship as **pre-converted CTranslate2
+int8 tarballs** attached to a GitHub Release. The Models Manager
+downloads the tarball, unpacks it into the right directory, and you're
+done — no Python, no torch, no `ct2-transformers-converter`.
+
+If you need to rebuild or add a model:
+
+1. Open the **Actions** tab on the repo.
+2. Select the **build-models** workflow → **Run workflow**.
+3. Choose:
+   - `release_tag` — usually `models-v1` (the tag the manifest URLs
+     point at). Bump only when changing model bytes.
+   - `models` — space-separated manifest keys
+     (`m2m100-418m-int8`, `small100-int8`, `opusmt-ru-en`, `opusmt-en-ru`).
+4. The workflow converts each model on a clean Ubuntu runner and
+   uploads the resulting `<key>.tar.gz` to the release.
+
+The first run creates the release; subsequent runs replace the
+artifacts in-place. After the workflow finishes, the application's
+Download buttons start working immediately — no app rebuild needed.
 3. Pick source and target languages in **Settings**, then press **Start**
    on the **Main** tab. **Cmd/Ctrl + Space** toggles Start/Stop.
 

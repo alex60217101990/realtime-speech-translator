@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/sample"
@@ -206,7 +206,7 @@ func report(label string, samples []time.Duration) {
 	}
 	cp := make([]time.Duration, len(samples))
 	copy(cp, samples)
-	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	slices.Sort(cp)
 	p50 := cp[len(cp)*50/100]
 	p95 := cp[min(len(cp)*95/100, len(cp)-1)]
 	p99 := cp[min(len(cp)*99/100, len(cp)-1)]

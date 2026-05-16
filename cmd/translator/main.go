@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/models/manifest"
 	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
+	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
 	"github.com/alex60217101990/realtime-speech-translator/internal/ui"
 	"github.com/alex60217101990/realtime-speech-translator/internal/vmic"
@@ -118,10 +120,11 @@ func main() {
 	}
 
 	modelFlag := flag.String("model", "", "path to Whisper ggml model (overrides config)")
-	mtBackend := flag.String("mt", saved.MTBackend, "MT backend: madlad | opusmt | off")
-	mtModelDir := flag.String("mt-model", "", "MADLAD model directory (CTranslate2 export)")
-	mtSPModel := flag.String("mt-spm", "", "MADLAD sentencepiece.model path")
+	mtBackend := flag.String("mt", saved.MTBackend, "MT backend: madlad | m2m100 | small100 | opusmt | off")
+	mtModelDir := flag.String("mt-model", "", "MT model directory (CTranslate2 export, used by madlad / m2m100)")
+	mtSPModel := flag.String("mt-spm", "", "MT sentencepiece.model path (used by madlad / m2m100)")
 	mtOPUSRoot := flag.String("opusmt-root", "", "OPUS-MT models root with {src}-{dst} subdirs")
+	mtCacheSize := flag.Int("mt-cache", 1024, "LRU translation cache size (0 = disabled)")
 	srcFlag := flag.String("src", saved.SourceLang, "source language (ISO-639-1) or 'auto'")
 	dstFlag := flag.String("dst", saved.TargetLang, "target language (ISO-639-1)")
 
@@ -151,47 +154,92 @@ func main() {
 		slog.Info("routing to virtual mic", "device", chosenDevName, "kind", chosenDevKind)
 	}
 
+	var mtEng mt.Engine
 	switch *mtBackend {
 	case "madlad":
-		// Resolve MT paths: CLI flags win, otherwise look at the
-		// default MADLAD location populated by the Models tab
-		// downloader.
-		mdir, spm := *mtModelDir, *mtSPModel
-		if mdir == "" || spm == "" {
-			if defaultDir, err := paths.MTDir("madlad-400-3b-int8"); err == nil {
-				if mdir == "" && paths.Exists(filepath.Join(defaultDir, "model.bin")) {
-					mdir = defaultDir
-				}
-				if spm == "" {
-					cand := filepath.Join(defaultDir, "sentencepiece.model")
-					if paths.Exists(cand) {
-						spm = cand
-					}
-				}
-			}
-		}
+		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "madlad-400-3b-int8", "sentencepiece.model")
 		if mdir != "" && spm != "" {
 			eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(mdir, spm))
 			if err != nil {
 				slog.Error("madlad init failed", "err", err)
 				log.Fatalf("madlad: %v", err)
 			}
-			cfg.MTBackend = eng
-			slog.Info("MADLAD loaded", "dir", mdir, "spm", spm)
+			mtEng = eng
+			slog.Info("MADLAD loaded", "dir", mdir, "spm", spm,
+				"note", "quality tier — high accuracy but slow on CPU; consider m2m100 or opusmt for realtime")
 		} else {
 			slog.Warn("MT disabled: MADLAD model not present — open the Models tab to download it")
 		}
+	case "m2m100":
+		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "m2m100-418m-int8", "sentencepiece.bpe.model")
+		if mdir != "" && spm != "" {
+			eng, err := mt.NewM2M100(mt.DefaultM2M100Config(mdir, spm))
+			if err != nil {
+				slog.Error("m2m100 init failed", "err", err)
+				log.Fatalf("m2m100: %v", err)
+			}
+			mtEng = eng
+			slog.Info("m2m100 loaded", "dir", mdir, "spm", spm,
+				"note", "balanced tier — 100 languages, 1-3s/utterance on CPU")
+		} else {
+			slog.Warn("MT disabled: m2m100 model not present — see README for manual install")
+		}
+	case "small100":
+		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "small100-int8", "sentencepiece.bpe.model")
+		if mdir != "" && spm != "" {
+			eng, err := mt.NewM2M100(mt.DefaultSMaLL100Config(mdir, spm))
+			if err != nil {
+				slog.Error("small100 init failed", "err", err)
+				log.Fatalf("small100: %v", err)
+			}
+			mtEng = eng
+			slog.Info("SMaLL-100 loaded", "dir", mdir, "spm", spm,
+				"note", "realtime tier — 100 languages, distilled m2m100, ~330M params")
+		} else {
+			slog.Warn("MT disabled: small100 model not present — see README for manual install")
+		}
 	case "opusmt":
-		if *mtOPUSRoot != "" {
-			eng, err := mt.NewOPUSMT(mt.DefaultOPUSMTConfig(*mtOPUSRoot))
+		root := *mtOPUSRoot
+		if root == "" {
+			if defaultRoot, err := paths.OPUSMTRoot(); err == nil && paths.Exists(defaultRoot) {
+				root = defaultRoot
+			}
+		}
+		if root != "" {
+			eng, err := mt.NewOPUSMT(mt.DefaultOPUSMTConfig(root))
 			if err != nil {
 				log.Fatalf("opusmt: %v", err)
 			}
-			cfg.MTBackend = eng
+			mtEng = eng
+			slog.Info("OPUS-MT loaded", "root", root,
+				"note", "realtime tier — per-pair, smallest and fastest")
+		} else {
+			slog.Warn("MT disabled: no OPUS-MT models found — open the Models tab to download a pair")
 		}
 	case "off":
 	default:
 		log.Fatalf("unknown --mt backend: %s", *mtBackend)
+	}
+	var mtCache *mt.Cached
+	if mtEng != nil {
+		// LRU cache collapses repeated phrases to a hashmap lookup —
+		// huge win on short interjections and stock greetings. Serial
+		// guards CT2's single-replica thread model. Persistent on disk
+		// so the application gets faster the more it is used.
+		tmPath, _ := paths.TranslationMemory()
+		cached, err := mt.LoadCached(mtEng, *mtCacheSize, tmPath)
+		if err != nil {
+			slog.Warn("translation memory init failed; running uncached", "err", err)
+			cfg.MTBackend = mt.Serial(mtEng)
+		} else {
+			mtCache = cached
+			cfg.MTBackend = mt.Serial(cached)
+		}
+		// Warm-up: first translate after model load incurs a one-off
+		// initialisation cost (CT2 lazy buffers, OPUS-MT pair load on
+		// first use). Doing it now keeps the first real utterance off
+		// the cold path.
+		go mt.Warmup(cfg.MTBackend, cfg.SourceLang, cfg.TargetLang)
 	}
 
 	if *ttsOn {
@@ -255,10 +303,28 @@ func main() {
 		)
 	}
 	defer func() {
+		if mtCache != nil {
+			if err := mtCache.Sync(); err != nil {
+				slog.Warn("translation memory final sync failed", "err", err)
+			}
+		}
 		if err := sess.Close(); err != nil {
 			log.Printf("session close: %v", err)
 		}
 	}()
+	// Periodic translation-memory flush — bounds data loss to ~30 s
+	// in a hard crash. Cheap (only writes when dirty).
+	if mtCache != nil {
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				if err := mtCache.Sync(); err != nil {
+					slog.Debug("translation memory periodic sync failed", "err", err)
+				}
+			}
+		}()
+	}
 
 	a := app.NewWithID("io.github.alex60217101990.rst")
 	ui.ApplyTheme(a, saved.Theme)
@@ -270,13 +336,23 @@ func main() {
 	_ = statusBind.Set("Status: idle")
 	statsBind := binding.NewString()
 	_ = statsBind.Set("STT: —   MT: —   TTS: —   Drops: 0   Underruns: 0")
+	lagBind := binding.NewString()
+	_ = lagBind.Set("Lag: —   display: —   (hangover: —   queue: —   stt: —   mt: —   prev_tts: —)")
+	tmBind := binding.NewString()
+	_ = tmBind.Set("TM: —")
 	transcriptBind := binding.NewString()
 	translationBind := binding.NewString()
+	partialBind := binding.NewString()
 	_ = transcriptBind.Set("")
 	_ = translationBind.Set("")
+	_ = partialBind.Set("")
 
 	statusLbl := widget.NewLabelWithData(statusBind)
 	statsLbl := widget.NewLabelWithData(statsBind)
+	lagLbl := widget.NewLabelWithData(lagBind)
+	tmLbl := widget.NewLabelWithData(tmBind)
+	partialLbl := widget.NewLabelWithData(partialBind)
+	partialLbl.Wrapping = fyne.TextWrapWord
 	transcriptArea := widget.NewMultiLineEntry()
 	transcriptArea.Bind(transcriptBind)
 	transcriptArea.SetMinRowsVisible(14)
@@ -288,13 +364,17 @@ func main() {
 	if cfg.TTSBackend != nil {
 		ttsStatus = "piper"
 	}
+	mtStatus := *mtBackend
+	if *mtBackend != "off" && cfg.MTBackend == nil {
+		mtStatus = *mtBackend + " (NOT LOADED)"
+	}
 	vmicStatus := "not found"
 	if !missingVMic {
 		vmicStatus = chosenDevName
 	}
 	headerBar := widget.NewLabel(fmt.Sprintf(
 		"Source: %s   Target: %s   MT: %s   TTS: %s   VMic: %s",
-		cfg.SourceLang, cfg.TargetLang, *mtBackend, ttsStatus, vmicStatus,
+		cfg.SourceLang, cfg.TargetLang, mtStatus, ttsStatus, vmicStatus,
 	))
 
 	var startBtn *widget.Button
@@ -318,8 +398,74 @@ func main() {
 	}
 	startBtn = widget.NewButton("Start", toggleSession)
 
+	// lastEv is the most recent finalised event with a non-empty
+	// translation. Captured under lastEvMu so the Fix-translation
+	// dialog reads a consistent snapshot. Nil until the first event
+	// arrives.
+	var (
+		lastEv   *stt.Event
+		lastEvMu sync.Mutex
+	)
+	fixBtn := widget.NewButton("Fix last translation", func() {
+		lastEvMu.Lock()
+		ev := lastEv
+		lastEvMu.Unlock()
+		if ev == nil || ev.Translation == "" || mtCache == nil {
+			dialog.ShowInformation("Fix translation",
+				"No translation to fix yet — speak something first.", w)
+			return
+		}
+		entry := widget.NewMultiLineEntry()
+		entry.SetText(ev.Translation)
+		entry.SetMinRowsVisible(4)
+		// Showing both source and current translation gives the user
+		// the context they need to correct it without leaving the
+		// dialog. The pinned correction goes into the TM and survives
+		// across sessions; future identical inputs hit cache.
+		form := []*widget.FormItem{
+			{Text: "Source (" + ev.Language + ")", Widget: widget.NewLabel(ev.Text)},
+			{Text: "Translation (" + ev.TargetLang + ")", Widget: entry},
+		}
+		dialog.ShowForm("Fix translation", "Save", "Cancel", form, func(ok bool) {
+			if !ok {
+				return
+			}
+			corrected := strings.TrimSpace(entry.Text)
+			if corrected == "" || corrected == ev.Translation {
+				return
+			}
+			mtCache.Override(ev.Text, ev.Language, ev.TargetLang, corrected)
+			_ = mtCache.Sync()
+			// Replace the latest translation line in the visible pane
+			// so the user sees their correction stick immediately.
+			cur, _ := translationBind.Get()
+			_ = translationBind.Set(cur + fmt.Sprintf("[%s] (fixed) %s\n", ev.TargetLang, corrected))
+		}, w)
+	})
+
+	// Partial transcripts: in-progress preview shown above the final
+	// transcript area. Clears on Final or on a non-speaking tick.
+	go func() {
+		for pt := range sess.Partials() {
+			if pt.Final {
+				_ = partialBind.Set("")
+				continue
+			}
+			_ = partialBind.Set(fmt.Sprintf("… [%s] %s", pt.Language, pt.Text))
+		}
+	}()
+
 	go func() {
 		for ev := range sess.Events() {
+			if ev.Translation != "" {
+				snap := ev
+				lastEvMu.Lock()
+				lastEv = &snap
+				lastEvMu.Unlock()
+			}
+			// Final transcript arrived — wipe the partial preview so
+			// the user doesn't see the same sentence twice.
+			_ = partialBind.Set("")
 			cur, _ := transcriptBind.Get()
 			_ = transcriptBind.Set(cur + fmt.Sprintf("[%s] %s\n", ev.Language, ev.Text))
 			if ev.Translation != "" {
@@ -334,18 +480,60 @@ func main() {
 				sess.DroppedSamples(),
 				sess.PlaybackUnderruns(),
 			))
+			rtf := 0.0
+			if ev.Duration > 0 {
+				rtf = float64(ev.STTLatency) / float64(ev.Duration)
+			}
+			_ = lagBind.Set(fmt.Sprintf(
+				"Lag: %s (utt %s, STT RTF %.2fx)   hangover: %s   queue: %s   stt: %s   mt: %s   prev_tts: %s",
+				// DisplayLatency is what the user feels — time from
+				// end-of-speech to translation visible. TTS plays out
+				// asynchronously and no longer gates this number.
+				ev.DisplayLatency.Round(time.Millisecond),
+				ev.Duration.Round(time.Millisecond),
+				rtf,
+				ev.HangoverLatency.Round(time.Millisecond),
+				ev.QueueLatency.Round(time.Millisecond),
+				ev.STTLatency.Round(time.Millisecond),
+				ev.MTLatency.Round(time.Millisecond),
+				ev.TTSLatency.Round(time.Millisecond),
+			))
 		}
 	}()
 
+	viz := ui.NewVoiceViz()
+	// Status (5 Hz) and viz (30 Hz) live on separate tickers: the
+	// status string changes slowly and only needs to be re-rendered
+	// when something is visibly different, while the viz wants smooth
+	// motion to feel alive. Reading PeakAbs+Reset on both tickers
+	// would race them, so we share a single source of truth here.
+	var (
+		levelMu sync.Mutex
+		curPeak float64 // 0..1, smoothed
+	)
+	go func() {
+		t := time.NewTicker(33 * time.Millisecond) // ~30 Hz
+		defer t.Stop()
+		for range t.C {
+			peak := sess.PeakAbs()
+			sess.PeakAbsReset()
+			lvl := float64(peak) / 32768.0
+			levelMu.Lock()
+			curPeak = lvl
+			levelMu.Unlock()
+			viz.SetLevel(float32(lvl), sess.IsSpeaking())
+			fyne.Do(viz.Refresh)
+		}
+	}()
 	go func() {
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
 			state := sess.State()
 			seconds := float64(sess.CapturedSamples()) / 16000.0
-			peak := sess.PeakAbs()
-			level := float64(peak) / 32768.0 // 0..1
-			sess.PeakAbsReset()
+			levelMu.Lock()
+			level := curPeak
+			levelMu.Unlock()
 			total, active, utts, drops := sess.VADStats()
 			activePct := 0.0
 			if total > 0 {
@@ -355,10 +543,20 @@ func main() {
 				"Status: %s   Captured: %.1fs   Mic: %3.0f%%   VAD active: %.0f%%   Utts: %d (drop %d)",
 				state.String(), seconds, level*100, activePct, utts, drops,
 			))
+			if mtCache != nil {
+				st := mtCache.Stats()
+				_ = tmBind.Set(fmt.Sprintf(
+					"TM: %d entries (%d pinned)   hits %d / miss %d (%.0f%%)   saved ≈ %s",
+					st.Size, st.Pinned, st.Hits, st.Misses, st.HitRate*100,
+					st.SavedTotal.Round(time.Second),
+				))
+			}
 		}
 	}()
 
-	headerBox := container.NewVBox(headerBar, statusLbl, statsLbl, startBtn)
+	vizBox := container.NewCenter(viz)
+	headerBox := container.NewVBox(headerBar, statusLbl, statsLbl, lagLbl, tmLbl, partialLbl, vizBox,
+		container.NewGridWithColumns(2, startBtn, fixBtn))
 	if health.HFPSuspect {
 		warn := widget.NewLabel(fmt.Sprintf(
 			"⚠ Bluetooth headset is in HFP mode (mic forces %d Hz mono SCO). Speech quality may drop. Use a wired mic for best results.",
@@ -499,7 +697,32 @@ func resolveModelPath(flagVal, whisperName string) (string, error) {
 	}
 	name := whisperName
 	if name == "" {
-		name = "small"
+		name = "base"
 	}
 	return paths.Whisper(name)
+}
+
+// resolveCT2Model resolves a CT2 model directory + sentencepiece file
+// for a MADLAD-style backend (one model + one tokenizer alongside).
+// CLI flags win; otherwise we look under the platform data dir the
+// Models tab populated (paths.MTDir(<manifestKey>)).
+func resolveCT2Model(flagDir, flagSPM, manifestKey, spmFilename string) (dir, spm string) {
+	dir, spm = flagDir, flagSPM
+	if dir != "" && spm != "" {
+		return
+	}
+	defaultDir, err := paths.MTDir(manifestKey)
+	if err != nil {
+		return
+	}
+	if dir == "" && paths.Exists(filepath.Join(defaultDir, "model.bin")) {
+		dir = defaultDir
+	}
+	if spm == "" {
+		cand := filepath.Join(defaultDir, spmFilename)
+		if paths.Exists(cand) {
+			spm = cand
+		}
+	}
+	return
 }

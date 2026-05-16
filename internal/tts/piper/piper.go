@@ -182,7 +182,7 @@ func bytesToInt16(b []byte) []int16 {
 	// copying decoder.
 	if binary.NativeEndian.Uint16([]byte{1, 0}) != 1 {
 		out := make([]int16, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			out[i] = int16(binary.LittleEndian.Uint16(b[i*2:]))
 		}
 		return out

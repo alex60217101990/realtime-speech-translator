@@ -32,9 +32,18 @@ const SamplesPerFrame = SampleRate * FrameMs / 1000 // 480
 // trimmed off. PCM is owned by the receiver after read; the segmenter
 // does not retain it.
 type Utterance struct {
-	PCM       []int16
+	PCM []int16
+	// StartedAt is the wall-clock moment the first speech frame of this
+	// utterance was observed.
 	StartedAt time.Time
-	Duration  time.Duration
+	// Duration is the active speech length (hangover excluded).
+	Duration time.Duration
+	// EmittedAt is the wall-clock moment the segmenter decided the
+	// utterance was complete and pushed it onto the output channel.
+	// (StartedAt + Duration) ≈ end-of-speech; EmittedAt - that gap
+	// equals the hangover wait the user perceives before transcription
+	// can start.
+	EmittedAt time.Time
 }
 
 // Config controls segmentation behaviour.
@@ -64,12 +73,18 @@ type Config struct {
 
 // DefaultConfig returns a Config tuned for conversational speech at
 // 16 kHz mono.
+//
+// HangoverMs/MaxSpeechMs are tuned for low perceived latency: a 200 ms
+// hangover still keeps natural mid-sentence pauses joined while
+// shaving 100 ms off the user-visible lag, and a 6 s MaxSpeechMs caps
+// the worst-case Whisper input length so end-to-end latency cannot
+// blow past ~real-time × utterance even on a long monologue.
 func DefaultConfig() Config {
 	return Config{
 		Aggressiveness: 2,
 		MinSpeechMs:    200,
-		MaxSpeechMs:    15000,
-		HangoverMs:     300,
+		MaxSpeechMs:    6000,
+		HangoverMs:     200,
 		PrePadMs:       150,
 	}
 }
@@ -213,6 +228,7 @@ func (s *Segmenter) processFrame(frame []int16) {
 			PCM:       pcm,
 			StartedAt: s.startedAt,
 			Duration:  time.Duration(s.speechMs) * time.Millisecond,
+			EmittedAt: time.Now(),
 		}
 		select {
 		case s.out <- ut:
@@ -249,6 +265,35 @@ func (s *Segmenter) Stats() Stats {
 		Utterances:   s.utterances.Load(),
 		Drops:        s.drops.Load(),
 	}
+}
+
+// IsSpeaking reports whether the segmenter is currently inside an
+// utterance (between speech onset and hangover close). Read under the
+// frame mutex so callers see a value consistent with the most recent
+// processFrame; the lock is short and contention-free in practice
+// since WriteFrame is the only writer.
+func (s *Segmenter) IsSpeaking() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.speaking
+}
+
+// SnapshotCurrent returns a copy of the accumulating utterance buffer
+// alongside its current speech duration. Used by the partial-transcript
+// path: while an utterance is still open, the pipeline runs Whisper
+// against the snapshot to produce a "what's been said so far" preview.
+//
+// Returns (nil, 0) when the segmenter is not currently inside an
+// utterance (no speech in progress). Caller owns the returned slice.
+func (s *Segmenter) SnapshotCurrent() ([]int16, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.speaking || len(s.curr) == 0 {
+		return nil, 0
+	}
+	pcm := make([]int16, len(s.curr))
+	copy(pcm, s.curr)
+	return pcm, time.Duration(s.speechMs) * time.Millisecond
 }
 
 // Close releases the WebRTC VAD context and closes the output channel.

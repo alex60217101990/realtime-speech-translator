@@ -190,6 +190,10 @@ func New(cfg Config) (*Session, error) {
 // Events returns the channel that emits recognised utterances.
 func (s *Session) Events() <-chan stt.Event { return s.pipeline.Output() }
 
+// Partials returns the in-progress transcript channel from the
+// pipeline. Empty when partials are disabled in config.
+func (s *Session) Partials() <-chan stt.Partial { return s.pipeline.PartialOutput() }
+
 // State returns the current session state.
 func (s *Session) State() State { return State(s.state.Load()) }
 
@@ -347,6 +351,16 @@ func (s *Session) VADStats() (total, active, utterances, drops uint64) {
 	}
 	st := s.pipeline.VADStats()
 	return st.TotalFrames, st.ActiveFrames, st.Utterances, st.Drops
+}
+
+// IsSpeaking forwards the segmenter's current "inside an utterance"
+// flag. Used by the live voice-viz widget so it can colour itself
+// "speaking" without waiting for a finished utterance.
+func (s *Session) IsSpeaking() bool {
+	if s.pipeline == nil {
+		return false
+	}
+	return s.pipeline.IsSpeaking()
 }
 
 // PlaybackUnderruns reports samples the TTS playback device had to fill
