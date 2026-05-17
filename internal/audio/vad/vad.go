@@ -126,11 +126,23 @@ type Config struct {
 // blow past ~real-time × utterance even on a long monologue.
 func DefaultConfig() Config {
 	return Config{
-		Aggressiveness: 2,
+		// Aggressiveness 1 keeps quiet inter-word vowels classified as
+		// speech instead of carving silence out of every clause.
+		Aggressiveness: 1,
 		MinSpeechMs:    200,
-		MaxSpeechMs:    6000,
-		HangoverMs:     200,
-		PrePadMs:       150,
+		// 12 s gives a long monologue room to land in one utterance,
+		// preserving the InitialPrompt context across the whole
+		// thought instead of force-splitting at 6 s.
+		MaxSpeechMs: 12000,
+		// 800 ms hangover covers the clause-level pauses real speakers
+		// take (mid-sentence comma, breath) without breaking the
+		// utterance. The 200 ms previous value was carved at every
+		// comma and Whisper lost the surrounding context. Trade-off:
+		// the final chunk of a long utterance shows ~600 ms later
+		// than before, but the live partial transcript keeps the UI
+		// responsive in the meantime.
+		HangoverMs: 800,
+		PrePadMs:   150,
 	}
 }
 

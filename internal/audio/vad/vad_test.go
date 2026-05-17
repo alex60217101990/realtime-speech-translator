@@ -26,9 +26,11 @@ func TestSegmenterUtteranceDetected(t *testing.T) {
 	}
 	defer s.Close()
 
-	// 800 ms tone + 500 ms silence => one utterance of ~800 ms.
+	// 800 ms tone + 1000 ms silence => one utterance of ~800 ms.
+	// Silence must exceed DefaultConfig.HangoverMs (800 ms) for the
+	// segmenter to close the utterance and emit it.
 	speechSamples := 800 * SampleRate / 1000
-	silenceSamples := 500 * SampleRate / 1000
+	silenceSamples := 1000 * SampleRate / 1000
 
 	s.WriteFrame(sine(speechSamples))
 	s.WriteFrame(silence(silenceSamples))
