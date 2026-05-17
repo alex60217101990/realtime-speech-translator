@@ -2,6 +2,7 @@ package mt
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt/ct2"
@@ -44,10 +45,25 @@ func DefaultM2M100Config(modelDir, spModel string) M2M100Config {
 		ModelDir:           modelDir,
 		SentencePieceModel: spModel,
 		BeamSize:           1,
-		MaxDecodingLength:  256,
-		Threads:            0,
-		ComputeType:        ct2.ComputeInt8,
+		// 96 covers a typical spoken utterance (≤ ~50 tokens) plus
+		// headroom; 256 was inherited from upstream defaults aimed at
+		// document translation and forces the greedy decoder to keep
+		// generating well past EOS on weird inputs, doubling latency.
+		MaxDecodingLength: 96,
+		// Half the CPU keeps Whisper and m2m100 from oversubscribing
+		// when they overlap in the async pipeline. Floor at 2 so
+		// single-/dual-core hosts still progress.
+		Threads:     cpuHalfFloor2(),
+		ComputeType: ct2.ComputeInt8,
 	}
+}
+
+// cpuHalfFloor2 returns NumCPU/2 with a floor of 2. Used by m2m100 /
+// SMaLL-100 to size CT2's per-replica thread pool so it shares cores
+// with Whisper rather than fighting for them.
+func cpuHalfFloor2() int {
+	n := max(runtime.NumCPU()/2, 2)
+	return n
 }
 
 // DefaultSMaLL100Config returns a Config preconfigured for SMaLL-100.
@@ -132,11 +148,23 @@ func (m *M2M100) Translate(src, srcLang, dstLang string) (string, error) {
 		decoderPrefix = []string{dstTag}
 	}
 	sourcePieces = append(sourcePieces, pieces...)
+	// m2m100 / SMaLL-100 expect an explicit </s> at the end of the
+	// source sequence. Without it the decoder has no learned stopping
+	// signal and degenerates into repeating the highest-probability
+	// token until max_decoding_length is hit (observed: "Let''''…" /
+	// "Al Al Al Al…" with 60+ s MT latency).
+	sourcePieces = append(sourcePieces, "</s>")
 
 	outPieces, err := m.tr.Translate(sourcePieces, ct2.TranslateOptions{
 		BeamSize:           m.cfg.BeamSize,
 		MaxDecodingLength:  m.cfg.MaxDecodingLength,
 		TargetPrefixPieces: decoderPrefix,
+		// 1.05 + n-gram 3 is the standard m2m100 anti-loop setup —
+		// degenerate repetitions ("Let''''…", "Al Al Al…") on noisy
+		// STT input get cut short, and well-formed input typically
+		// hits EOS earlier, shaving wall time on every utterance.
+		RepetitionPenalty: 1.05,
+		NoRepeatNgramSize: 3,
 	})
 	if err != nil {
 		return "", fmt.Errorf("m2m100: translate: %w", err)

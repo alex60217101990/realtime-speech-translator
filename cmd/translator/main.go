@@ -159,73 +159,7 @@ func main() {
 	// (open Models tab, Re-download or switch backend) is *through*
 	// the GUI. On any init failure we log a warning, leave mtEng nil,
 	// and the application starts with translation disabled.
-	var mtEng mt.Engine
-	switch *mtBackend {
-	case "madlad":
-		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "madlad-400-3b-int8", "sentencepiece.model")
-		if mdir != "" && spm != "" {
-			eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(mdir, spm))
-			if err != nil {
-				slog.Warn("MADLAD init failed — running with MT disabled; fix via Models / Settings", "err", err)
-			} else {
-				mtEng = eng
-				slog.Info("MADLAD loaded", "dir", mdir, "spm", spm,
-					"note", "quality tier — high accuracy but slow on CPU; consider m2m100 or opusmt for realtime")
-			}
-		} else {
-			slog.Warn("MT disabled: MADLAD model not present — open the Models tab to download it")
-		}
-	case "m2m100":
-		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "m2m100-418m-int8", "sentencepiece.bpe.model")
-		if mdir != "" && spm != "" {
-			eng, err := mt.NewM2M100(mt.DefaultM2M100Config(mdir, spm))
-			if err != nil {
-				slog.Warn("m2m100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
-			} else {
-				mtEng = eng
-				slog.Info("m2m100 loaded", "dir", mdir, "spm", spm,
-					"note", "balanced tier — 100 languages, 1-3s/utterance on CPU")
-			}
-		} else {
-			slog.Warn("MT disabled: m2m100 model not present — see README for manual install")
-		}
-	case "small100":
-		mdir, spm := resolveCT2Model(*mtModelDir, *mtSPModel, "small100-int8", "sentencepiece.bpe.model")
-		if mdir != "" && spm != "" {
-			eng, err := mt.NewM2M100(mt.DefaultSMaLL100Config(mdir, spm))
-			if err != nil {
-				slog.Warn("small100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
-			} else {
-				mtEng = eng
-				slog.Info("SMaLL-100 loaded", "dir", mdir, "spm", spm,
-					"note", "realtime tier — 100 languages, distilled m2m100, ~330M params")
-			}
-		} else {
-			slog.Warn("MT disabled: small100 model not present — see README for manual install")
-		}
-	case "opusmt":
-		root := *mtOPUSRoot
-		if root == "" {
-			if defaultRoot, err := paths.OPUSMTRoot(); err == nil && paths.Exists(defaultRoot) {
-				root = defaultRoot
-			}
-		}
-		if root != "" {
-			eng, err := mt.NewOPUSMT(mt.DefaultOPUSMTConfig(root))
-			if err != nil {
-				slog.Warn("opusmt init failed — running with MT disabled; fix via Models / Settings", "err", err, "root", root)
-			} else {
-				mtEng = eng
-				slog.Info("OPUS-MT loaded", "root", root,
-					"note", "realtime tier — per-pair, smallest and fastest")
-			}
-		} else {
-			slog.Warn("MT disabled: no OPUS-MT models found — open the Models tab to download a pair")
-		}
-	case "off":
-	default:
-		slog.Warn("unknown --mt backend, running with MT disabled", "backend", *mtBackend)
-	}
+	mtEng := loadMTEngine(*mtBackend, *mtModelDir, *mtSPModel, *mtOPUSRoot)
 	var mtCache *mt.Cached
 	if mtEng != nil {
 		// LRU cache collapses repeated phrases to a hashmap lookup —
@@ -370,18 +304,23 @@ func main() {
 	if cfg.TTSBackend != nil {
 		ttsStatus = "piper"
 	}
-	mtStatus := *mtBackend
-	if *mtBackend != "off" && cfg.MTBackend == nil {
-		mtStatus = *mtBackend + " (NOT LOADED)"
-	}
 	vmicStatus := "not found"
 	if !missingVMic {
 		vmicStatus = chosenDevName
 	}
-	headerBar := widget.NewLabel(fmt.Sprintf(
-		"Source: %s   Target: %s   MT: %s   TTS: %s   VMic: %s",
-		cfg.SourceLang, cfg.TargetLang, mtStatus, ttsStatus, vmicStatus,
-	))
+	headerBind := binding.NewString()
+	renderHeader := func(mtStatus string) {
+		_ = headerBind.Set(fmt.Sprintf(
+			"Source: %s   Target: %s   MT: %s   TTS: %s   VMic: %s",
+			cfg.SourceLang, cfg.TargetLang, mtStatus, ttsStatus, vmicStatus,
+		))
+	}
+	initialMTStatus := *mtBackend
+	if *mtBackend != "off" && cfg.MTBackend == nil {
+		initialMTStatus = *mtBackend + " (NOT LOADED)"
+	}
+	renderHeader(initialMTStatus)
+	headerBar := widget.NewLabelWithData(headerBind)
 
 	var startBtn *widget.Button
 	toggleSession := func() {
@@ -463,21 +402,15 @@ func main() {
 
 	go func() {
 		for ev := range sess.Events() {
-			if ev.Translation != "" {
-				snap := ev
-				lastEvMu.Lock()
-				lastEv = &snap
-				lastEvMu.Unlock()
-			}
+			snap := ev
+			lastEvMu.Lock()
+			lastEv = &snap
+			lastEvMu.Unlock()
 			// Final transcript arrived — wipe the partial preview so
 			// the user doesn't see the same sentence twice.
 			_ = partialBind.Set("")
 			cur, _ := transcriptBind.Get()
 			_ = transcriptBind.Set(cur + fmt.Sprintf("[%s] %s\n", ev.Language, ev.Text))
-			if ev.Translation != "" {
-				cur2, _ := translationBind.Get()
-				_ = translationBind.Set(cur2 + fmt.Sprintf("[%s] %s\n", ev.TargetLang, ev.Translation))
-			}
 			_ = statsBind.Set(fmt.Sprintf(
 				"STT: %s   MT: %s   TTS: %s   Drops: %d   Underruns: %d",
 				ev.STTLatency.Round(time.Millisecond),
@@ -491,10 +424,12 @@ func main() {
 				rtf = float64(ev.STTLatency) / float64(ev.Duration)
 			}
 			_ = lagBind.Set(fmt.Sprintf(
-				"Lag: %s (utt %s, STT RTF %.2fx)   hangover: %s   queue: %s   stt: %s   mt: %s   prev_tts: %s",
-				// DisplayLatency is what the user feels — time from
-				// end-of-speech to translation visible. TTS plays out
-				// asynchronously and no longer gates this number.
+				"Lag: %s (utt %s, STT RTF %.2fx)   hangover: %s   queue: %s   stt: %s   prev_mt: %s   prev_tts: %s",
+				// DisplayLatency is end-of-speech → transcript visible.
+				// MT runs asynchronously now, so this number captures
+				// only the path that matters for the first user-visible
+				// artifact. The translation lag is reported separately
+				// when each TranslationUpdate lands.
 				ev.DisplayLatency.Round(time.Millisecond),
 				ev.Duration.Round(time.Millisecond),
 				rtf,
@@ -504,6 +439,25 @@ func main() {
 				ev.MTLatency.Round(time.Millisecond),
 				ev.TTSLatency.Round(time.Millisecond),
 			))
+		}
+	}()
+
+	// Translation updates arrive asynchronously after the matching
+	// Event. Append the translated line and patch the lastEv snapshot
+	// used by the Fix-translation dialog so it has Translation /
+	// TargetLang populated.
+	go func() {
+		for upd := range sess.Translations() {
+			cur, _ := translationBind.Get()
+			_ = translationBind.Set(cur + fmt.Sprintf("[%s] %s\n", upd.TargetLang, upd.Translation))
+			lastEvMu.Lock()
+			if lastEv != nil && lastEv.ID == upd.EventID {
+				lastEv.Translation = upd.Translation
+				lastEv.TargetLang = upd.TargetLang
+				lastEv.MTLatency = upd.MTLatency
+				lastEv.TotalLatency = upd.TotalLatency
+			}
+			lastEvMu.Unlock()
 		}
 	}()
 
@@ -586,7 +540,42 @@ func main() {
 		},
 		OnThemeChange: func(name string) { ui.ApplyTheme(a, name) },
 	})
-	modelsTab := ui.ModelsScreen(w)
+	// onMTInstalled lets the Models tab notify us when a download for an
+	// MT row finished. We re-resolve the engine using the same loader
+	// used at startup and hot-swap it into the running pipeline so the
+	// "(NOT LOADED)" status flips to "loaded" without a restart.
+	onMTInstalled := func(backend string) {
+		if backend == "" || backend == "off" {
+			return
+		}
+		// Only react if the installed model matches the user's active
+		// MT choice. Downloading a different backend's model should not
+		// silently switch what's running.
+		if backend != *mtBackend {
+			slog.Info("ignored MT hot-reload: installed backend differs from --mt",
+				"installed", backend, "active", *mtBackend)
+			return
+		}
+		newEng := loadMTEngine(*mtBackend, *mtModelDir, *mtSPModel, *mtOPUSRoot)
+		if newEng == nil {
+			fyne.Do(func() { renderHeader(*mtBackend + " (NOT LOADED)") })
+			return
+		}
+		// Re-wrap with cache + persistent translation memory so the
+		// reloaded engine matches the startup wiring.
+		var wrapped mt.Engine = newEng
+		tmPath, _ := paths.TranslationMemory()
+		if cached, err := mt.LoadCached(newEng, *mtCacheSize, tmPath); err == nil {
+			wrapped = cached
+		} else {
+			slog.Warn("translation memory init failed; running uncached", "err", err)
+		}
+		sess.ReloadMT(wrapped, cfg.TargetLang)
+		go mt.Warmup(wrapped, cfg.SourceLang, cfg.TargetLang)
+		fyne.Do(func() { renderHeader(*mtBackend) })
+		slog.Info("MT hot-reloaded", "backend", *mtBackend)
+	}
+	modelsTab := ui.ModelsScreen(w, ui.ModelsCallbacks{OnMTInstalled: onMTInstalled})
 
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Main", mainTab),
@@ -706,6 +695,82 @@ func resolveModelPath(flagVal, whisperName string) (string, error) {
 		name = "base"
 	}
 	return paths.Whisper(name)
+}
+
+// loadMTEngine constructs the MT engine for the named backend. Returns
+// nil (with a warning logged) when the model is missing or init fails;
+// callers run with translation disabled and the user can fix it later
+// from the Models / Settings tabs. Used both at startup and after a
+// hot-reload from the Models tab.
+func loadMTEngine(backend, flagDir, flagSPM, flagOPUSRoot string) mt.Engine {
+	switch backend {
+	case "madlad":
+		mdir, spm := resolveCT2Model(flagDir, flagSPM, "madlad-400-3b-int8", "sentencepiece.model")
+		if mdir == "" || spm == "" {
+			slog.Warn("MT disabled: MADLAD model not present — open the Models tab to download it")
+			return nil
+		}
+		eng, err := mt.NewMADLAD(mt.DefaultMADLADConfig(mdir, spm))
+		if err != nil {
+			slog.Warn("MADLAD init failed — running with MT disabled; fix via Models / Settings", "err", err)
+			return nil
+		}
+		slog.Info("MADLAD loaded", "dir", mdir, "spm", spm,
+			"note", "quality tier — high accuracy but slow on CPU; consider m2m100 or opusmt for realtime")
+		return eng
+	case "m2m100":
+		mdir, spm := resolveCT2Model(flagDir, flagSPM, "m2m100-418m-int8", "sentencepiece.bpe.model")
+		if mdir == "" || spm == "" {
+			slog.Warn("MT disabled: m2m100 model not present — see README for manual install")
+			return nil
+		}
+		eng, err := mt.NewM2M100(mt.DefaultM2M100Config(mdir, spm))
+		if err != nil {
+			slog.Warn("m2m100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
+			return nil
+		}
+		slog.Info("m2m100 loaded", "dir", mdir, "spm", spm,
+			"note", "balanced tier — 100 languages, 1-3s/utterance on CPU")
+		return eng
+	case "small100":
+		mdir, spm := resolveCT2Model(flagDir, flagSPM, "small100-int8", "sentencepiece.bpe.model")
+		if mdir == "" || spm == "" {
+			slog.Warn("MT disabled: small100 model not present — see README for manual install")
+			return nil
+		}
+		eng, err := mt.NewM2M100(mt.DefaultSMaLL100Config(mdir, spm))
+		if err != nil {
+			slog.Warn("small100 init failed — running with MT disabled; fix via Models / Settings", "err", err, "dir", mdir, "spm", spm)
+			return nil
+		}
+		slog.Info("SMaLL-100 loaded", "dir", mdir, "spm", spm,
+			"note", "realtime tier — 100 languages, distilled m2m100, ~330M params")
+		return eng
+	case "opusmt":
+		root := flagOPUSRoot
+		if root == "" {
+			if defaultRoot, err := paths.OPUSMTRoot(); err == nil && paths.Exists(defaultRoot) {
+				root = defaultRoot
+			}
+		}
+		if root == "" {
+			slog.Warn("MT disabled: no OPUS-MT models found — open the Models tab to download a pair")
+			return nil
+		}
+		eng, err := mt.NewOPUSMT(mt.DefaultOPUSMTConfig(root))
+		if err != nil {
+			slog.Warn("opusmt init failed — running with MT disabled; fix via Models / Settings", "err", err, "root", root)
+			return nil
+		}
+		slog.Info("OPUS-MT loaded", "root", root,
+			"note", "realtime tier — per-pair, smallest and fastest")
+		return eng
+	case "off", "":
+		return nil
+	default:
+		slog.Warn("unknown --mt backend, running with MT disabled", "backend", backend)
+		return nil
+	}
 }
 
 // resolveCT2Model resolves a CT2 model directory + sentencepiece file

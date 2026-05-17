@@ -61,6 +61,11 @@ type AudioSink interface {
 // perceives between speaking and seeing the translation. TTS playback
 // runs off the critical path on a separate goroutine.
 type Event struct {
+	// ID is a monotonic counter assigned by the Pipeline. The async
+	// MT worker emits a matching TranslationUpdate carrying the same
+	// ID once translation completes; the UI uses it to attach the
+	// translation to the right transcript line.
+	ID              uint64
 	Text            string
 	Language        string
 	Translation     string
@@ -133,8 +138,14 @@ func DefaultConfig() Config {
 		Engine:             whisper.DefaultConfig(),
 		PromptHistory:      1,
 		OutputBuffer:       8,
-		PartialPeriod:      700 * time.Millisecond,
-		PartialMinDuration: 500 * time.Millisecond,
+		// Partials run a fresh full-buffer Whisper Transcribe each tick,
+		// which on CPU competes with the final Transcribe and the
+		// parallel MT pass. 1500 ms cadence cuts the partial workload
+		// in half versus the previous 700 ms; long enough that there is
+		// new audio worth decoding, short enough that the live lane
+		// still feels responsive.
+		PartialPeriod:      1500 * time.Millisecond,
+		PartialMinDuration: 700 * time.Millisecond,
 	}
 }
 
@@ -151,6 +162,24 @@ type Partial struct {
 	Final    bool
 }
 
+// TranslationUpdate carries the result of an async MT pass back to the
+// UI. It is paired with a prior Event by EventID; the UI typically
+// appends one Translation line per update, in arrival order (the MT
+// worker is serial so updates arrive FIFO).
+type TranslationUpdate struct {
+	EventID     uint64
+	SourceText  string
+	Translation string
+	SourceLang  string
+	TargetLang  string
+	MTLatency   time.Duration
+	// TotalLatency is end-of-speech → translation visible (includes
+	// the upstream STT + MT queueing). Distinct from Event.DisplayLatency
+	// which is end-of-speech → transcript visible.
+	TotalLatency time.Duration
+	SpeechEnd    time.Time
+}
+
 // Pipeline runs VAD + Whisper + (optional) MT + (optional) TTS as a
 // single coordinated unit.
 type Pipeline struct {
@@ -160,10 +189,19 @@ type Pipeline struct {
 
 	ctx context.Context // set in Start; used by TTS Synthesize
 
-	out      chan Event
-	partials chan Partial
-	done     chan struct{}
-	wg       sync.WaitGroup
+	out          chan Event
+	translations chan TranslationUpdate
+	partials     chan Partial
+	done         chan struct{}
+	wg           sync.WaitGroup
+
+	// mtQ feeds the async MT worker. Decoupling MT from the STT
+	// consumer goroutine lets utterance N+1 start its Whisper pass
+	// while utterance N is still being translated, dropping perceived
+	// queue lag to ~0 on sustained speech.
+	mtQ      chan mtJob
+	mtDrops  atomic.Uint64
+	lastMTLag atomic.Int64 // nanoseconds; surfaced in following Events
 
 	// ttsQ feeds the async TTS worker. Synthesize+playback are off the
 	// critical path so the UI sees the translation as soon as MT
@@ -172,10 +210,22 @@ type Pipeline struct {
 	lastTTSLag atomic.Int64 // nanoseconds; surfaced into the next Event
 	ttsDrops   atomic.Uint64
 
+	eventSeq atomic.Uint64
+
 	mu      sync.Mutex
 	prompt  string // rolling InitialPrompt assembled from previous finals
 	vocab   map[string]int // word frequency table, used to bias Whisper
 	running bool
+}
+
+// mtJob carries the data the async MT worker needs to translate one
+// utterance and emit a TranslationUpdate paired with the originating
+// Event.
+type mtJob struct {
+	eventID   uint64
+	text      string
+	srcLang   string
+	speechEnd time.Time
 }
 
 // ttsJob is what handleUtterance hands to the TTS worker. text/lang are
@@ -203,13 +253,19 @@ func New(modelPath string, cfg Config) (*Pipeline, error) {
 		return nil, err
 	}
 	return &Pipeline{
-		cfg:      cfg,
-		seg:      seg,
-		engine:   eng,
-		out:      make(chan Event, cfg.OutputBuffer),
-		partials: make(chan Partial, 4),
-		done:     make(chan struct{}),
-		vocab:    make(map[string]int, 256),
+		cfg:          cfg,
+		seg:          seg,
+		engine:       eng,
+		out:          make(chan Event, cfg.OutputBuffer),
+		translations: make(chan TranslationUpdate, cfg.OutputBuffer),
+		partials:     make(chan Partial, 4),
+		done:         make(chan struct{}),
+		vocab:        make(map[string]int, 256),
+		// Cap=4 lets two utterances queue for MT without blocking the
+		// STT goroutine. Anything beyond that is dropped because m2m100
+		// at ~1-2 s/utt cannot keep up with a faster speaker; older
+		// jobs are stale by the time MT would reach them anyway.
+		mtQ: make(chan mtJob, 4),
 		// Cap=2 keeps TTS at most one utterance behind the displayed
 		// translation. Overflow is preferable to unbounded growth: if
 		// the user speaks faster than Piper can render, dropping older
@@ -228,9 +284,24 @@ func (p *Pipeline) Output() <-chan Event { return p.out }
 // Partial{Final: true} or when the corresponding final Event arrives.
 func (p *Pipeline) PartialOutput() <-chan Partial { return p.partials }
 
+// TranslationOutput returns the channel that emits async MT results.
+// Each TranslationUpdate corresponds to a previously-emitted Event with
+// the same EventID. Closed when the Pipeline is stopped via Close.
+func (p *Pipeline) TranslationOutput() <-chan TranslationUpdate { return p.translations }
+
 // VADStats exposes the segmenter counters so the UI can render a live
 // "VAD is firing" indicator without poking the internal segmenter.
 func (p *Pipeline) VADStats() vad.Stats { return p.seg.Stats() }
+
+// SetMT swaps the MT engine and target language at runtime. Safe to call
+// from any goroutine; the next handleUtterance picks up the new engine.
+// Pass nil to disable MT (transcripts are emitted without translation).
+func (p *Pipeline) SetMT(eng mt.Engine, targetLang string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cfg.MT = eng
+	p.cfg.TargetLang = targetLang
+}
 
 // IsSpeaking forwards the segmenter's live "inside an utterance" flag.
 // Used by the voice-viz widget so it can switch to its "speaking"
@@ -265,6 +336,12 @@ func (p *Pipeline) Start(ctx context.Context) error {
 	}
 	p.wg.Add(1)
 	go p.run(ctx)
+	// MT worker is always started — handleUtterance funnels jobs into
+	// mtQ unconditionally and the worker no-ops when cfg.MT is nil.
+	// Keeping it on simplifies SetMT (hot-reload from the Models tab)
+	// because we don't have to manage worker lifecycle on engine swaps.
+	p.wg.Add(1)
+	go p.runMT(ctx)
 	if p.cfg.TTS != nil {
 		p.wg.Add(1)
 		go p.runTTS(ctx)
@@ -363,6 +440,11 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	p.mu.Unlock()
 
 	tr, err := p.engine.Transcribe(ut.PCM, &override)
+	// PCM is consumed by Transcribe (it copies into its float32
+	// buffer) — return the int16 slice to the segmenter's pool now so
+	// the next utterance can reuse the backing array instead of
+	// allocating fresh. Safe to call on any path including error.
+	vad.ReleasePCM(ut.PCM)
 	if err != nil {
 		// Stay alive — a single bad utterance shouldn't tear the
 		// pipeline down. The UI can surface error counters separately.
@@ -385,6 +467,20 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	text := normalize(tr.Text)
 	if text == "" {
 		slog.Debug("transcript empty after normalize", "raw", tr.Text)
+		return
+	}
+	if isHallucination(text) {
+		// Whisper trained on YouTube emits subtitle-credit phrases on
+		// silence / low-energy buffers ("Субтитры создавал DimaTorzok",
+		// "Редактор субтитров А.Синецкая", "Thanks for watching", …).
+		// Drop them instead of feeding MT/TTS with phantom content.
+		slog.Debug("dropped hallucinated transcript", "text", text, "lang", tr.Language)
+		if p.cfg.PartialPeriod > 0 {
+			select {
+			case p.partials <- Partial{Final: true, Text: "", Language: tr.Language, Duration: ut.Duration}:
+			default:
+			}
+		}
 		return
 	}
 
@@ -419,41 +515,44 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 		}
 	}
 
-	if p.cfg.MT != nil && p.cfg.TargetLang != "" && tr.Language != p.cfg.TargetLang {
-		t0 := time.Now()
-		translation, err := p.cfg.MT.Translate(text, tr.Language, p.cfg.TargetLang)
-		ev.MTLatency = time.Since(t0)
-		if err == nil {
-			ev.Translation = translation
-			ev.TargetLang = p.cfg.TargetLang
-		} else {
-			slog.Warn("mt translate failed", "err", err, "src_lang", tr.Language, "dst_lang", p.cfg.TargetLang)
-		}
-		// On MT error we still emit the transcript; the user sees it
-		// and can choose another model or language.
-	}
+	// Snapshot MT engine + target lang under the lock so a concurrent
+	// SetMT (called from the Models tab after a successful download)
+	// can swap the engine without racing this handler.
+	p.mu.Lock()
+	mtEng := p.cfg.MT
+	mtTarget := p.cfg.TargetLang
+	p.mu.Unlock()
+	willTranslate := mtEng != nil && mtTarget != "" && tr.Language != mtTarget
 
-	// DisplayLatency is what the user actually feels: end-of-speech ->
-	// translation visible. TTS playback is downstream of this point
-	// and runs on its own goroutine so we don't gate the UI on it.
+	// DisplayLatency is end-of-speech → transcript visible. MT now
+	// runs asynchronously, so this no longer includes MT time —
+	// transcripts ship as soon as Whisper returns, and the translation
+	// is patched in later via TranslationUpdate. That cut wall-time
+	// to the first user-visible artifact from ~stt+mt to ~stt alone.
+	ev.ID = p.eventSeq.Add(1)
 	ev.DisplayLatency = time.Since(speechEnd)
 	// TTSLatency on this event reflects the *previous* utterance's
 	// synthesise wall time — there's no way to know the current one
 	// before we ship it. Good enough for a trend indicator in the UI.
 	ev.TTSLatency = time.Duration(p.lastTTSLag.Load())
+	// MTLatency on the Event reflects the previous utterance's MT
+	// wall time (because the current one hasn't been translated yet).
+	// The accurate per-event value arrives on the TranslationUpdate.
+	ev.MTLatency = time.Duration(p.lastMTLag.Load())
 	ev.TotalLatency = ev.DisplayLatency + ev.TTSLatency
 
 	slog.Info("utterance ready",
+		"event_id", ev.ID,
 		"text", ev.Text,
-		"translation", ev.Translation,
 		"lang", ev.Language,
-		"target", ev.TargetLang,
+		"target", mtTarget,
+		"will_translate", willTranslate,
 		"duration", ev.Duration,
 		"hangover", ev.HangoverLatency,
 		"queue", ev.QueueLatency,
 		"stt", ev.STTLatency,
-		"mt", ev.MTLatency,
 		"display", ev.DisplayLatency,
+		"prev_mt", ev.MTLatency,
 		"prev_tts", ev.TTSLatency,
 		"slowest_display_stage", slowestDisplayStage(ev),
 	)
@@ -465,24 +564,115 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 		// segmenter consumer loop.
 	}
 
-	// Hand the spoken text to the async TTS worker. We pick the
-	// translation when available, otherwise the original transcript
-	// so the user still hears something when MT is disabled.
-	if p.cfg.TTS != nil {
-		spokenText := ev.Translation
-		spokenLang := ev.TargetLang
-		if spokenText == "" {
-			spokenText = ev.Text
-			spokenLang = ev.Language
+	if willTranslate {
+		job := mtJob{
+			eventID:   ev.ID,
+			text:      ev.Text,
+			srcLang:   ev.Language,
+			speechEnd: speechEnd,
 		}
-		if spokenText != "" && spokenLang != "" {
-			job := ttsJob{text: spokenText, lang: spokenLang, speechEnd: speechEnd}
+		select {
+		case p.mtQ <- job:
+		default:
+			// MT worker is behind — drop rather than block STT.
+			// Without this, a speaker who outpaces the translator
+			// would stall the segmenter consumer and cause queue
+			// latency to compound.
+			p.mtDrops.Add(1)
+			slog.Warn("mt queue full, dropping utterance",
+				"event_id", ev.ID, "drops", p.mtDrops.Load())
+		}
+	} else if p.cfg.TTS != nil {
+		// MT off (e.g. same source / target language). Hand the
+		// raw transcript to TTS directly so the user still hears
+		// playback when configured.
+		p.enqueueTTS(ev.Text, ev.Language, speechEnd)
+	}
+}
+
+// enqueueTTS pushes a job onto the TTS worker. Best-effort: full queue
+// drops rather than blocking the caller. Centralised so both the
+// MT-disabled path (handleUtterance) and the MT-success path (runMT)
+// share one bookkeeping site.
+func (p *Pipeline) enqueueTTS(text, lang string, speechEnd time.Time) {
+	if p.cfg.TTS == nil || text == "" || lang == "" {
+		return
+	}
+	job := ttsJob{text: text, lang: lang, speechEnd: speechEnd}
+	select {
+	case p.ttsQ <- job:
+	default:
+		p.ttsDrops.Add(1)
+		slog.Warn("tts queue full, dropping utterance", "lang", lang, "drops", p.ttsDrops.Load())
+	}
+}
+
+// runMT drains the MT queue serially. Each job runs Translate against
+// the engine snapshotted at job-pickup time, emits a TranslationUpdate,
+// and (if TTS is configured) forwards the translated text to the TTS
+// worker. Decoupling from handleUtterance is the main latency win:
+// utterance N+1's Whisper pass starts the instant utterance N is
+// emitted, instead of waiting through utterance N's MT.
+func (p *Pipeline) runMT(ctx context.Context) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.done:
+			return
+		case job, ok := <-p.mtQ:
+			if !ok {
+				return
+			}
+			p.mu.Lock()
+			mtEng := p.cfg.MT
+			mtTarget := p.cfg.TargetLang
+			p.mu.Unlock()
+			if mtEng == nil || mtTarget == "" {
+				// Engine was swapped to nil between enqueue and pickup.
+				// Skip translation but still fire TTS on raw transcript
+				// so playback works in MT-off mode.
+				p.enqueueTTS(job.text, job.srcLang, job.speechEnd)
+				continue
+			}
+			t0 := time.Now()
+			translation, err := mtEng.Translate(job.text, job.srcLang, mtTarget)
+			lat := time.Since(t0)
+			p.lastMTLag.Store(int64(lat))
+			if err != nil {
+				slog.Warn("mt translate failed",
+					"err", err, "event_id", job.eventID,
+					"src_lang", job.srcLang, "dst_lang", mtTarget)
+				// Best-effort: still let TTS read the source.
+				p.enqueueTTS(job.text, job.srcLang, job.speechEnd)
+				continue
+			}
+			upd := TranslationUpdate{
+				EventID:      job.eventID,
+				SourceText:   job.text,
+				Translation:  translation,
+				SourceLang:   job.srcLang,
+				TargetLang:   mtTarget,
+				MTLatency:    lat,
+				TotalLatency: time.Since(job.speechEnd),
+				SpeechEnd:    job.speechEnd,
+			}
 			select {
-			case p.ttsQ <- job:
+			case p.translations <- upd:
 			default:
-				// TTS worker is behind — drop rather than block STT.
-				p.ttsDrops.Add(1)
-				slog.Warn("tts queue full, dropping utterance", "lang", spokenLang, "drops", p.ttsDrops.Load())
+				slog.Warn("translation output channel full, dropping update",
+					"event_id", job.eventID)
+			}
+			slog.Info("mt translated",
+				"event_id", job.eventID,
+				"src_lang", job.srcLang, "dst_lang", mtTarget,
+				"mt", lat, "total_to_translation", upd.TotalLatency,
+			)
+			if translation != "" {
+				p.enqueueTTS(translation, mtTarget, job.speechEnd)
+			} else {
+				p.enqueueTTS(job.text, job.srcLang, job.speechEnd)
 			}
 		}
 	}
@@ -522,11 +712,13 @@ func (p *Pipeline) runPartials(ctx context.Context) {
 			}
 			pcm, dur := p.seg.SnapshotCurrent()
 			if dur < minDur || len(pcm) == 0 {
+				vad.ReleasePCM(pcm)
 				continue
 			}
 			if dur == lastDur {
 				// No new audio since the previous tick; skip the
 				// (expensive) decode and try again next period.
+				vad.ReleasePCM(pcm)
 				continue
 			}
 			lastDur = dur
@@ -536,6 +728,7 @@ func (p *Pipeline) runPartials(ctx context.Context) {
 			// final path uses.
 			cfg := p.cfg.Engine
 			tr, err := p.engine.Transcribe(pcm, &cfg)
+			vad.ReleasePCM(pcm)
 			if err != nil {
 				slog.Debug("partial transcribe failed", "err", err)
 				continue
@@ -652,6 +845,7 @@ func (p *Pipeline) Close() error {
 	// recover guards against a double-Close from buggy callers.
 	safeClose(p.out)
 	safeClosePartial(p.partials)
+	safeCloseTranslations(p.translations)
 	if err := p.engine.Close(); err != nil {
 		return fmt.Errorf("stt: close engine: %w", err)
 	}
@@ -667,6 +861,52 @@ func safeClose(ch chan Event) {
 func safeClosePartial(ch chan Partial) {
 	defer func() { _ = recover() }()
 	close(ch)
+}
+
+func safeCloseTranslations(ch chan TranslationUpdate) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
+// hallucinationFingerprints are canonical Whisper "phantom subtitle"
+// outputs we have actually observed in slog. Match rule: the whole
+// transcript, lower-cased and stripped of trailing punctuation, must
+// equal one of these strings. Substring matching was tried and
+// rejected because tokens like "корректор" / "субтитры" legitimately
+// appear in user speech and were causing real utterances to be
+// silently dropped.
+var hallucinationFingerprints = map[string]struct{}{
+	"субтитры сделал dimatorzok":                                 {},
+	"субтитры создавал dimatorzok":                               {},
+	"субтитры подогнал «коронован»":                              {},
+	"редактор субтитров а.синецкая корректор а.егорова":          {},
+	"редактор субтитров а.синецкая\nкорректор а.егорова":         {},
+	"продолжение следует...":                                     {},
+	"продолжение следует":                                        {},
+	"спасибо за просмотр":                                        {},
+	"спасибо за внимание":                                        {},
+	"подписывайтесь на канал":                                    {},
+	"thanks for watching":                                        {},
+	"thank you for watching":                                     {},
+	"please subscribe":                                           {},
+	"like and subscribe":                                         {},
+	"see you in the next video":                                  {},
+}
+
+// isHallucination reports whether text exactly matches a known
+// Whisper phantom subtitle fingerprint. Conservative by design: real
+// speech that merely mentions one of these phrases as a fragment is
+// kept; only outputs that consist entirely of the fingerprint are
+// dropped.
+func isHallucination(text string) bool {
+	if text == "" {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(text))
+	low = strings.TrimRight(low, ".!?…")
+	low = strings.TrimSpace(low)
+	_, hit := hallucinationFingerprints[low]
+	return hit
 }
 
 // normalize trims surrounding whitespace from Whisper output and drops
