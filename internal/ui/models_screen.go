@@ -17,10 +17,23 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
 )
 
+// ModelsCallbacks lets the parent UI react to actions inside the
+// Models tab. All callbacks are optional.
+type ModelsCallbacks struct {
+	// OnMTInstalled fires after an MT row's primary archive (or
+	// model.bin + extras) finished downloading and verifying. Backend
+	// is the manifest backend tag ("madlad" / "m2m100" / "small100" /
+	// "opusmt"); the parent uses it to decide whether to hot-swap the
+	// running translator. Called from a goroutine — wrap UI work in
+	// fyne.Do.
+	OnMTInstalled func(backend string)
+}
+
 // modelRow describes a single row in the Models Manager list.
 type modelRow struct {
 	id        string
 	kind      string // "whisper" / "tts" / "mt"
+	backend   string // manifest backend tag, empty for non-MT rows
 	label     string
 	sizeMB    int
 	tier      manifest.Tier
@@ -131,6 +144,7 @@ func gatherRows(m *manifest.File) []modelRow {
 		row := modelRow{
 			id:        name,
 			kind:      "mt",
+			backend:   mt.Backend,
 			label:     "MT " + name,
 			sizeMB:    mt.SizeMB,
 			tier:      mt.Tier,
@@ -171,8 +185,10 @@ func gatherRows(m *manifest.File) []modelRow {
 }
 
 // ModelsScreen builds a Fyne widget that lists every model in the
-// embedded manifest and lets the user download missing ones.
-func ModelsScreen(w fyne.Window) fyne.CanvasObject {
+// embedded manifest and lets the user download missing ones. Optional
+// callbacks let the parent UI react to install events (e.g. hot-reload
+// the MT engine).
+func ModelsScreen(w fyne.Window, cb ModelsCallbacks) fyne.CanvasObject {
 	mf, err := manifest.Load()
 	if err != nil {
 		return widget.NewLabel("manifest load failed: " + err.Error())
@@ -199,18 +215,24 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 		progress.Hide()
 		var btn *widget.Button
 		btn = widget.NewButton(rowAction(row), func() {
-			if row.installed() {
-				return // delete-flow lives in M6
-			}
 			if row.manual {
 				// No reliable mirror — point at the README and let the
 				// user convert + copy manually. Doing nothing here is
 				// the right action; the row label already explains.
 				return
 			}
+			reinstall := row.installed()
 			btn.Disable()
 			progress.Show()
 			go func() {
+				if reinstall {
+					// Re-download: wipe existing files so the row stops
+					// reporting "installed" and the standard fetch path
+					// can overwrite cleanly. Stale assets matter when CI
+					// has republished a Release tag with new contents.
+					removeInstalledFiles(row)
+					fyne.Do(func() { statusLbl.SetText("re-downloading…") })
+				}
 				err := downloadRow(context.Background(), dlClient, row, progress, statusLbl)
 				fyne.Do(func() {
 					if err != nil {
@@ -225,6 +247,9 @@ func ModelsScreen(w fyne.Window) fyne.CanvasObject {
 					progress.Hide()
 					btn.Enable()
 				})
+				if err == nil && row.kind == "mt" && cb.OnMTInstalled != nil {
+					cb.OnMTInstalled(row.backend)
+				}
 			}()
 		})
 		if row.manual && !row.installed() {
@@ -332,6 +357,19 @@ func diskUsageSummary(rows []modelRow) string {
 		}
 	}
 	return fmt.Sprintf("Disk usage: %d MB", bytes>>20)
+}
+
+// removeInstalledFiles deletes a row's primary file and any sidecar
+// extras, best-effort. Used by the Re-download path so the next fetch
+// starts from a clean slate (matters when a CI-republished Release tag
+// has the same URL but different contents).
+func removeInstalledFiles(r modelRow) {
+	_ = os.Remove(r.localPath)
+	for _, e := range r.extras {
+		if e.localPath != "" {
+			_ = os.Remove(e.localPath)
+		}
+	}
 }
 
 func downloadRow(ctx context.Context, d *downloader.Downloader, r modelRow, bar *widget.ProgressBar, status *widget.Label) error {

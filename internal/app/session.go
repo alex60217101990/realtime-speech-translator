@@ -194,8 +194,35 @@ func (s *Session) Events() <-chan stt.Event { return s.pipeline.Output() }
 // pipeline. Empty when partials are disabled in config.
 func (s *Session) Partials() <-chan stt.Partial { return s.pipeline.PartialOutput() }
 
+// Translations returns the async MT result channel. Each update
+// corresponds to a previously-emitted Event with the same EventID.
+func (s *Session) Translations() <-chan stt.TranslationUpdate {
+	return s.pipeline.TranslationOutput()
+}
+
 // State returns the current session state.
 func (s *Session) State() State { return State(s.state.Load()) }
+
+// ReloadMT swaps the active MT engine in the running pipeline without
+// stopping the audio loop. Pass a nil engine to disable translation.
+// targetLang is the ISO-639-1 code MT should produce; ignored when
+// eng is nil.
+//
+// Wrapped in mt.Serial because CT2 replicas are not safe for concurrent
+// Translate calls. Callers that already pass a serialised engine still
+// pay only the cost of one extra mutex; the gain is centralising the
+// invariant so individual call-sites can stay simple.
+func (s *Session) ReloadMT(eng mt.Engine, targetLang string) {
+	s.cfg.MTBackend = eng
+	if eng != nil && targetLang != "" {
+		s.cfg.TargetLang = targetLang
+	}
+	if eng == nil {
+		s.pipeline.SetMT(nil, "")
+		return
+	}
+	s.pipeline.SetMT(mt.Serial(eng), targetLang)
+}
 
 // Start activates the capture device, the STT pipeline and (if
 // configured) the playback device for TTS output.

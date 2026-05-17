@@ -159,7 +159,12 @@ build_ctranslate2() {
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     $blas_flag
-  "$CMAKE" --build "$build" --target ctranslate2 --parallel "$JOBS"
+  # Build the full tree, not just `--target ctranslate2`. CT2's nested
+  # statics (cpu_features, ruy_*, cpuinfo, clog) are PUBLIC link deps
+  # of libctranslate2.a but are not bundled into it — building only
+  # the ctranslate2 target leaves their .a files absent and downstream
+  # cgo links fail with `library 'cpu_features' not found`.
+  "$CMAKE" --build "$build" --parallel "$JOBS"
 }
 
 case "${1:-all}" in

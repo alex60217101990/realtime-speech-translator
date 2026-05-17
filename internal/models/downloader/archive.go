@@ -97,11 +97,11 @@ func stripTopLevel(name string) string {
 	if name == "" {
 		return ""
 	}
-	slash := strings.IndexByte(name, '/')
-	if slash < 0 {
+	_, after, ok := strings.Cut(name, "/")
+	if !ok {
 		return name
 	}
-	rest := name[slash+1:]
+	rest := after
 	return rest
 }
 
