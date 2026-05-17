@@ -29,6 +29,7 @@ func DefaultOPUSMTConfig(modelsRoot string) OPUSMTConfig {
 		ModelsRoot:        modelsRoot,
 		BeamSize:          1,
 		MaxDecodingLength: 256,
+		Threads:           cpuHalfFloor2(),
 		ComputeType:       ct2.ComputeInt8,
 	}
 }

@@ -149,7 +149,13 @@ func (e *Engine) Transcribe(pcm []int16, override *Config) (*Transcript, error) 
 		cfg = mergeConfig(cfg, *override)
 	}
 	if cfg.Threads == 0 {
-		t := max(runtime.NumCPU()-1, 1)
+		// Whisper and CTranslate2 run concurrently in the async
+		// pipeline. Letting Whisper grab NumCPU-1 starves m2m100 on
+		// the next utterance and triggers context-switching thrashing
+		// (15 threads on 8 cores). Half of NumCPU keeps both engines
+		// responsive without oversubscription. Floor at 2 so even a
+		// 2-core box runs.
+		t := max(runtime.NumCPU()/2, 2)
 		cfg.Threads = t
 	}
 

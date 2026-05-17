@@ -30,7 +30,7 @@ func DefaultMADLADConfig(modelDir, spModel string) MADLADConfig {
 		SentencePieceModel: spModel,
 		BeamSize:           1,
 		MaxDecodingLength:  256,
-		Threads:            0,
+		Threads:            cpuHalfFloor2(),
 		ComputeType:        ct2.ComputeInt8,
 	}
 }

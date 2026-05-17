@@ -18,7 +18,7 @@ var hasAVX2 = archsimd.X86.AVX2()
 // Falls back to scalar for the tail and on CPUs without AVX2.
 func Int16ToFloat32(dst []float32, src []int16) {
 	if len(dst) < len(src) {
-		panic("sample: dst shorter than src")
+		panicShortDst()
 	}
 	n := len(src)
 	i := 0
@@ -45,7 +45,7 @@ func Int16ToFloat32(dst []float32, src []int16) {
 // so it is far cheaper than Int16ToFloat32 in the capture hot path.
 func Float32ToInt16(dst []int16, src []float32) {
 	if len(dst) < len(src) {
-		panic("sample: dst shorter than src")
+		panicShortDst()
 	}
 	for i, v := range src {
 		s := v * 32768.0

@@ -12,3 +12,11 @@ const (
 	// into the conventional float32 range used by Whisper, NLLB and Piper.
 	invInt16Scale float32 = 1.0 / 32768.0
 )
+
+// panicShortDst is outlined so the panic-string allocation does not
+// inflate the inlining size budget of the conversion hot wrappers
+// (Filippo Valsorda's efficient-APIs pattern: keep the wrapper tiny,
+// push the error path off-stack).
+func panicShortDst() {
+	panic("sample: dst shorter than src")
+}

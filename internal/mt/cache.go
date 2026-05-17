@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"hash/maphash"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,6 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// cacheHashSeed seeds every cache hash for the lifetime of the
+// process. Restarts re-hash on load — the index is rebuilt from each
+// entry's canonical string key, so a fresh seed per run does not
+// invalidate persisted entries.
+var cacheHashSeed = maphash.MakeSeed()
 
 // Cached wraps any Engine with an in-memory LRU keyed on the
 // (srcLang, dstLang, normalised-source) tuple. Repeated utterances —
@@ -34,7 +41,13 @@ type Cached struct {
 
 	mu    sync.Mutex
 	order *list.List
-	index map[string]*list.Element
+	// index keys on a 64-bit maphash of the (srcLang, dstLang, src)
+	// tuple instead of the canonical string. Saves the strings.Builder
+	// allocation on every Translate call; the entry's Key field still
+	// holds the canonical string for persistence and human debugging.
+	// Collision probability with ≤1024 entries is ~5e-17 per lookup;
+	// no second check is performed.
+	index map[uint64]*list.Element
 
 	path  string // empty = in-memory only
 	dirty atomic.Bool
@@ -77,7 +90,7 @@ func NewCached(e Engine, max int) Engine {
 		engine: e,
 		max:    max,
 		order:  list.New(),
-		index:  make(map[string]*list.Element, max),
+		index:  make(map[uint64]*list.Element, max),
 	}
 }
 
@@ -94,7 +107,7 @@ func LoadCached(e Engine, max int, path string) (*Cached, error) {
 		engine: e,
 		max:    max,
 		order:  list.New(),
-		index:  make(map[string]*list.Element, max),
+		index:  make(map[uint64]*list.Element, max),
 		path:   path,
 	}
 	if path != "" {
@@ -109,8 +122,8 @@ func LoadCached(e Engine, max int, path string) (*Cached, error) {
 // the result. Translation results are deterministic enough that
 // returning a previous answer for an identical input is safe.
 func (c *Cached) Translate(src, srcLang, dstLang string) (string, error) {
-	key := cacheKey(src, srcLang, dstLang)
-	if v, ok := c.lookup(key); ok {
+	h := cacheHash(src, srcLang, dstLang)
+	if v, ok := c.lookup(h); ok {
 		c.hits.Add(1)
 		// Approximate "saved time" by the rolling average miss cost
 		// (computed lazily to keep this path branch-free hot).
@@ -130,7 +143,7 @@ func (c *Cached) Translate(src, srcLang, dstLang string) (string, error) {
 	// separate moving-average struct, since stats are read at human
 	// cadence (UI ticker).
 	c.savedNs.Add(0) // touch ordering only
-	c.store(key, out, false /*not pinned*/, dt)
+	c.store(h, cacheKey(src, srcLang, dstLang), out, false /*not pinned*/, dt)
 	return out, nil
 }
 
@@ -147,7 +160,7 @@ func (c *Cached) Close() error {
 // entries are never evicted by the LRU and take priority over the MT
 // engine even on subsequent restarts.
 func (c *Cached) Override(src, srcLang, dstLang, corrected string) {
-	c.store(cacheKey(src, srcLang, dstLang), corrected, true, 0)
+	c.store(cacheHash(src, srcLang, dstLang), cacheKey(src, srcLang, dstLang), corrected, true, 0)
 }
 
 // Stats returns a copy of the current cache counters.
@@ -186,10 +199,10 @@ func (c *Cached) Sync() error {
 	return c.saveToDisk()
 }
 
-func (c *Cached) lookup(key string) (string, bool) {
+func (c *Cached) lookup(h uint64) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	el, ok := c.index[key]
+	el, ok := c.index[h]
 	if !ok {
 		return "", false
 	}
@@ -201,12 +214,15 @@ func (c *Cached) lookup(key string) (string, bool) {
 	return en.Value, true
 }
 
-// store inserts or updates an entry. lastCost feeds the moving
-// average for "time saved" estimation; pinned blocks LRU eviction.
-func (c *Cached) store(key, value string, pinned bool, lastCost time.Duration) {
+// store inserts or updates an entry. h is the hash used as the map
+// index; canonicalKey is the persisted-string form stored on the
+// cacheEntry so the disk format stays human-readable and reproducible.
+// lastCost feeds the moving average for "time saved" estimation;
+// pinned blocks LRU eviction.
+func (c *Cached) store(h uint64, canonicalKey, value string, pinned bool, lastCost time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if el, ok := c.index[key]; ok {
+	if el, ok := c.index[h]; ok {
 		en := el.Value.(*cacheEntry)
 		en.Value = value
 		if pinned && !en.Pinned {
@@ -219,7 +235,7 @@ func (c *Cached) store(key, value string, pinned bool, lastCost time.Duration) {
 		return
 	}
 	en := &cacheEntry{
-		Key:      key,
+		Key:      canonicalKey,
 		Value:    value,
 		Hits:     0,
 		Pinned:   pinned,
@@ -229,7 +245,7 @@ func (c *Cached) store(key, value string, pinned bool, lastCost time.Duration) {
 		c.pinned.Add(1)
 	}
 	el := c.order.PushFront(en)
-	c.index[key] = el
+	c.index[h] = el
 	c.dirty.Store(true)
 	// Evict only non-pinned tail entries.
 	for c.order.Len() > c.max {
@@ -245,14 +261,39 @@ func (c *Cached) store(key, value string, pinned bool, lastCost time.Duration) {
 			if ev == nil {
 				break
 			}
+			evEntry := ev.Value.(*cacheEntry)
 			c.order.Remove(ev)
-			delete(c.index, ev.Value.(*cacheEntry).Key)
+			delete(c.index, hashKey(evEntry.Key))
 			continue
 		}
 		c.order.Remove(back)
-		delete(c.index, ben.Key)
+		delete(c.index, hashKey(ben.Key))
 	}
 	_ = lastCost // reserved for future per-entry cost tracking
+}
+
+// hashKey hashes a canonical cache key string back into the map's
+// uint64 index space. Used during eviction (we have only the string
+// on the entry) and on load-from-disk to rebuild the index.
+func hashKey(canonicalKey string) uint64 {
+	var h maphash.Hash
+	h.SetSeed(cacheHashSeed)
+	h.WriteString(canonicalKey)
+	return h.Sum64()
+}
+
+// cacheHash composes the (srcLang, dstLang, src) tuple directly into
+// a maphash digest, avoiding the strings.Builder allocation that the
+// canonical-string path performs. Used on the hot Translate lookup.
+func cacheHash(src, srcLang, dstLang string) uint64 {
+	var h maphash.Hash
+	h.SetSeed(cacheHashSeed)
+	h.WriteString(strings.ToLower(srcLang))
+	h.WriteByte('|')
+	h.WriteString(strings.ToLower(dstLang))
+	h.WriteByte('|')
+	h.WriteString(strings.TrimSpace(src))
+	return h.Sum64()
 }
 
 func findEvictable(l *list.List) *list.Element {
@@ -333,13 +374,14 @@ func (c *Cached) loadFromDisk() error {
 		if c.order.Len() >= c.max {
 			break
 		}
+		h := hashKey(en.Key)
 		// Defend against duplicate keys in a corrupt file.
-		if _, ok := c.index[en.Key]; ok {
+		if _, ok := c.index[h]; ok {
 			continue
 		}
 		copy := *en // own the pointer
 		el := c.order.PushBack(&copy)
-		c.index[copy.Key] = el
+		c.index[h] = el
 		if copy.Pinned {
 			c.pinned.Add(1)
 		}

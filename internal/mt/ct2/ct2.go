@@ -105,6 +105,14 @@ type TranslateOptions struct {
 	BeamSize           int
 	MaxDecodingLength  int
 	TargetPrefixPieces []string
+	// RepetitionPenalty multiplies the log-prob of already-emitted
+	// tokens. 1.0 = neutral; 1.05-1.2 typical anti-loop range. 0
+	// leaves the CT2 default (1.0).
+	RepetitionPenalty float32
+	// NoRepeatNgramSize forbids emitting any n-gram that already
+	// appeared in the partial hypothesis. 3 is a good default for
+	// translation. 0 disables.
+	NoRepeatNgramSize int
 }
 
 // Translate runs translate_batch on a single sentence already tokenized
@@ -143,6 +151,8 @@ func (t *Translator) Translate(sourcePieces []string, opt TranslateOptions) ([]s
 		C.int32_t(len(prefixCStrs)),
 		C.int32_t(opt.BeamSize),
 		C.int32_t(opt.MaxDecodingLength),
+		C.float(opt.RepetitionPenalty),
+		C.int32_t(opt.NoRepeatNgramSize),
 		&outArr,
 		&outN,
 		&cerr,

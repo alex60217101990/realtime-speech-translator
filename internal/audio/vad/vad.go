@@ -21,6 +21,51 @@ import (
 // WebRTC supports 10/20/30 ms; 30 ms gives the best stability for speech.
 const FrameMs = 30
 
+// pcmPool recycles the per-utterance []int16 copy emitted on the
+// Output channel. Each utterance currently allocates fresh on close;
+// with the pool the GC sees zero churn on the audio thread once the
+// pool is warmed (one slice per concurrent utterance, which is at most
+// 4 — the Output channel cap). Buckets are size-typical (6 s @ 16 kHz =
+// 96000 int16 = 192 KB), so most reuses skip allocation entirely.
+var pcmPool = sync.Pool{
+	New: func() any {
+		// Pre-size to a typical max-length utterance so first use
+		// avoids a grow. Cap-only; len reset by the caller.
+		b := make([]int16, 0, 6*SampleRate)
+		return &b
+	},
+}
+
+// acquirePCM returns a []int16 of exactly n elements, reusing pool
+// memory when capacity allows. Tiny on purpose so the mid-stack
+// inliner brings it into processFrame and SnapshotCurrent. The slow
+// path (cap too small) is split out so the alloc does not bloat the
+// inlined size budget.
+func acquirePCM(n int) []int16 {
+	bp := pcmPool.Get().(*[]int16)
+	if cap(*bp) < n {
+		return acquirePCMSlow(n)
+	}
+	return (*bp)[:n]
+}
+
+func acquirePCMSlow(n int) []int16 {
+	// Pool entry too small for this utterance — allocate fresh and
+	// let the old slice fall out of scope. ReleasePCM will deposit
+	// the new larger backing the next time around.
+	return make([]int16, n)
+}
+
+// ReleasePCM returns an utterance PCM slice to the pool. Callers must
+// drop their reference to b after this call. Safe to call with cap(b)==0.
+func ReleasePCM(b []int16) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:0]
+	pcmPool.Put(&b)
+}
+
 // SampleRate is the only rate supported by this segmenter. Whisper input
 // is 16 kHz mono, so we match it.
 const SampleRate = 16000
@@ -222,7 +267,9 @@ func (s *Segmenter) processFrame(frame []int16) {
 
 	if s.speechMs >= s.cfg.MinSpeechMs {
 		// Copy out the utterance — the internal buffer is reused.
-		pcm := make([]int16, len(s.curr))
+		// pcm is pool-allocated; downstream consumer (stt.Pipeline)
+		// must call vad.ReleasePCM once Transcribe returns.
+		pcm := acquirePCM(len(s.curr))
 		copy(pcm, s.curr)
 		ut := Utterance{
 			PCM:       pcm,
@@ -291,7 +338,9 @@ func (s *Segmenter) SnapshotCurrent() ([]int16, time.Duration) {
 	if !s.speaking || len(s.curr) == 0 {
 		return nil, 0
 	}
-	pcm := make([]int16, len(s.curr))
+	// Pool-allocated; partial pass in stt.Pipeline.runPartials must
+	// call vad.ReleasePCM once Transcribe returns.
+	pcm := acquirePCM(len(s.curr))
 	copy(pcm, s.curr)
 	return pcm, time.Duration(s.speechMs) * time.Millisecond
 }
