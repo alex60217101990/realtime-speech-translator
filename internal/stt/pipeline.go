@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/vad"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
@@ -216,7 +217,46 @@ type Pipeline struct {
 	prompt  string // rolling InitialPrompt assembled from previous finals
 	vocab   map[string]int // word frequency table, used to bias Whisper
 	running bool
+
+	stitch stitchState
 }
+
+// stitchState coordinates the sentence-stitching guard that batches
+// mid-clause utterances into a single MT call. See routeMTJob.
+type stitchState struct {
+	mu      sync.Mutex
+	pending *stitchGroup
+	timer   *time.Timer
+}
+
+// stitchGroup is the pending stitch buffer: up to stitchMaxUtts
+// no-terminal-punct utterances accumulated within stitchWindow of
+// each other. On flush their texts are joined with a space and sent
+// as one mtJob using the last utterance's EventID — the UI threads
+// the eventual TranslationUpdate onto that line.
+type stitchGroup struct {
+	lastEventID uint64
+	texts       []string
+	srcLang     string
+	speechEnd   time.Time
+}
+
+const (
+	// stitchWindow is how long routeMTJob waits for a follow-on
+	// utterance before flushing a no-terminal-punct group on its own.
+	// Set to ~clause→clause cadence: short enough that a real end-of-
+	// thought finalises quickly, long enough to catch the typical
+	// hand-off ("Иван Иванович… приехал вчера").
+	stitchWindow = 1200 * time.Millisecond
+	// stitchMaxUtts caps how many fragments collapse into one MT call.
+	// Anything longer than three pieces almost certainly contains a
+	// genuine clause boundary the user wants translated separately.
+	stitchMaxUtts = 3
+	// stitchMaxUttDuration skips the stitch path entirely for long
+	// utterances — a 4 s phrase already carries enough context that
+	// stitching it onto the next one would over-batch.
+	stitchMaxUttDuration = 4 * time.Second
+)
 
 // mtJob carries the data the async MT worker needs to translate one
 // utterance and emit a TranslationUpdate paired with the originating
@@ -565,29 +605,135 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 	}
 
 	if willTranslate {
-		job := mtJob{
-			eventID:   ev.ID,
-			text:      ev.Text,
-			srcLang:   ev.Language,
-			speechEnd: speechEnd,
-		}
-		select {
-		case p.mtQ <- job:
-		default:
-			// MT worker is behind — drop rather than block STT.
-			// Without this, a speaker who outpaces the translator
-			// would stall the segmenter consumer and cause queue
-			// latency to compound.
-			p.mtDrops.Add(1)
-			slog.Warn("mt queue full, dropping utterance",
-				"event_id", ev.ID, "drops", p.mtDrops.Load())
-		}
+		p.routeMTJob(ev.ID, ev.Text, ev.Language, speechEnd, ev.Duration)
 	} else if p.cfg.TTS != nil {
 		// MT off (e.g. same source / target language). Hand the
 		// raw transcript to TTS directly so the user still hears
 		// playback when configured.
 		p.enqueueTTS(ev.Text, ev.Language, speechEnd)
 	}
+}
+
+// routeMTJob is the sentence-stitching gate sitting in front of the
+// MT worker queue. Mid-clause fragments (no terminal punctuation,
+// short duration) accumulate for up to stitchWindow so a clause-end
+// pause does not produce a translation that has lost context with the
+// rest of the thought. Utterances that look complete bypass the buffer
+// and ship immediately.
+//
+// Strategy A: transcript is already on the UI (handleUtterance emitted
+// the Event before calling here) — only translation/TTS dispatch is
+// deferred, so the user keeps seeing live text without flicker.
+func (p *Pipeline) routeMTJob(eventID uint64, text, srcLang string, speechEnd time.Time, duration time.Duration) {
+	skipStitch := endsWithTerminal(text) || duration > stitchMaxUttDuration
+
+	p.stitch.mu.Lock()
+	defer p.stitch.mu.Unlock()
+
+	if skipStitch {
+		// Flush whatever was held back so the order matches the user's
+		// speech, then ship the current utterance separately.
+		p.flushStitchLocked()
+		p.sendMTJobLocked(eventID, text, srcLang, speechEnd)
+		return
+	}
+
+	if p.stitch.pending == nil {
+		p.stitch.pending = &stitchGroup{
+			lastEventID: eventID,
+			texts:       []string{text},
+			srcLang:     srcLang,
+			speechEnd:   speechEnd,
+		}
+	} else if p.stitch.pending.srcLang != srcLang {
+		// Language hopped mid-stitch (rare — Whisper re-detect after a
+		// long pause). Flush previous, start fresh.
+		p.flushStitchLocked()
+		p.stitch.pending = &stitchGroup{
+			lastEventID: eventID,
+			texts:       []string{text},
+			srcLang:     srcLang,
+			speechEnd:   speechEnd,
+		}
+	} else {
+		p.stitch.pending.texts = append(p.stitch.pending.texts, text)
+		p.stitch.pending.lastEventID = eventID
+		p.stitch.pending.speechEnd = speechEnd
+		if len(p.stitch.pending.texts) >= stitchMaxUtts {
+			p.flushStitchLocked()
+			return
+		}
+	}
+
+	// (Re)arm the flush timer. Stop+reassign rather than Reset() so
+	// expired callbacks that already started running drop into a
+	// flushStitchLocked no-op (pending will be nil) and don't race.
+	if p.stitch.timer != nil {
+		p.stitch.timer.Stop()
+	}
+	p.stitch.timer = time.AfterFunc(stitchWindow, p.stitchTimeoutFlush)
+}
+
+// stitchTimeoutFlush runs on the timer goroutine and flushes whatever
+// was pending. Safe to fire after Close — flushStitchLocked is a
+// no-op when pending is nil.
+func (p *Pipeline) stitchTimeoutFlush() {
+	p.stitch.mu.Lock()
+	defer p.stitch.mu.Unlock()
+	p.flushStitchLocked()
+}
+
+// flushStitchLocked must be called with stitch.mu held. Joins the
+// pending fragments and dispatches one mtJob.
+func (p *Pipeline) flushStitchLocked() {
+	g := p.stitch.pending
+	if g == nil {
+		return
+	}
+	p.stitch.pending = nil
+	if p.stitch.timer != nil {
+		p.stitch.timer.Stop()
+		p.stitch.timer = nil
+	}
+	combined := strings.Join(g.texts, " ")
+	p.sendMTJobLocked(g.lastEventID, combined, g.srcLang, g.speechEnd)
+}
+
+// sendMTJobLocked pushes onto mtQ; caller already holds stitch.mu.
+// Non-blocking on a full queue — same back-pressure rule the MT
+// pipeline uses everywhere else.
+func (p *Pipeline) sendMTJobLocked(eventID uint64, text, srcLang string, speechEnd time.Time) {
+	job := mtJob{
+		eventID:   eventID,
+		text:      text,
+		srcLang:   srcLang,
+		speechEnd: speechEnd,
+	}
+	select {
+	case p.mtQ <- job:
+	default:
+		p.mtDrops.Add(1)
+		slog.Warn("mt queue full, dropping utterance",
+			"event_id", eventID, "drops", p.mtDrops.Load())
+	}
+}
+
+// endsWithTerminal reports whether text ends in a sentence-final
+// punctuation mark, after trimming trailing whitespace. Covers the
+// usual Latin/Cyrillic punctuation plus the common CJK variants the
+// Whisper post-processor occasionally emits.
+func endsWithTerminal(text string) bool {
+	t := strings.TrimRight(text, " \t\n\r")
+	if t == "" {
+		return false
+	}
+	r, _ := utf8.DecodeLastRuneInString(t)
+	switch r {
+	case '.', '!', '?', '…',
+		'。', '！', '？':
+		return true
+	}
+	return false
 }
 
 // enqueueTTS pushes a job onto the TTS worker. Best-effort: full queue
@@ -838,6 +984,11 @@ func (p *Pipeline) Close() error {
 			close(p.done)
 		}
 	}
+	// Flush any pending stitched fragment so its translation is not
+	// silently dropped on shutdown.
+	p.stitch.mu.Lock()
+	p.flushStitchLocked()
+	p.stitch.mu.Unlock()
 	_ = p.seg.Close()
 	p.wg.Wait()
 	// Close the event channel exactly once. After Close the UI
