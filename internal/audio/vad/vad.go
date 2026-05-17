@@ -66,6 +66,27 @@ func ReleasePCM(b []int16) {
 	pcmPool.Put(&b)
 }
 
+// int16PeakAbs returns the maximum absolute sample value in s. -32768
+// is clamped to 32767 because abs(int16(-32768)) would overflow; the
+// gate compares against a float64 noise floor so the clamp is harmless
+// (one count of imprecision on the most-saturated sample).
+func int16PeakAbs(s []int16) int32 {
+	var peak int32
+	for _, v := range s {
+		a := int32(v)
+		if a < 0 {
+			a = -a
+		}
+		if a > peak {
+			peak = a
+		}
+	}
+	if peak < 0 {
+		peak = 32767
+	}
+	return peak
+}
+
 // SampleRate is the only rate supported by this segmenter. Whisper input
 // is 16 kHz mono, so we match it.
 const SampleRate = 16000
@@ -131,17 +152,21 @@ func DefaultConfig() Config {
 		// transcribes as plausible-sounding garbage ("ревудишь",
 		// "вакуи фетилейный"). Stay strict.
 		Aggressiveness: 2,
-		MinSpeechMs:    200,
-		// 12 s gives a long monologue room to land in one utterance,
-		// preserving InitialPrompt context across the whole thought
-		// instead of force-splitting at 6 s.
+		// 300 ms floor blocks obvious noise burst durations (clicks,
+		// keypresses) while letting terse "да" / "ок" replies through.
+		// The energy gate (see processFrame) is the primary defence
+		// against hallucination-triggering low-RMS utterances.
+		MinSpeechMs: 300,
+		// 12 s cap keeps a long monologue in one utterance.
 		MaxSpeechMs: 12000,
-		// 500 ms hangover catches the clause-level comma pause (~200-
-		// 400 ms) without dragging a full second of silence into the
-		// PCM that Whisper later hallucinates over. The trailing
-		// silence is also trimmed at emit time (see processFrame) so
-		// the engine sees at most ~100 ms of tail quiet.
-		HangoverMs: 500,
+		// 200 ms hangover forces any real pause to close the utterance.
+		// Whisper never sees a multi-hundred-ms silence gap *inside*
+		// the audio (the source of "inserted words after a pause"
+		// hallucinations). The MT-layer stitching guard in
+		// internal/stt/pipeline.go glues the resulting fragments back
+		// into one translated thought when the first lacks terminal
+		// punctuation.
+		HangoverMs: 200,
 		PrePadMs:   150,
 	}
 }
@@ -161,6 +186,13 @@ type Segmenter struct {
 	speechMs  int // active-only duration; excludes hangover and pre-pad
 	speaking  bool
 
+	// bgPeak is an EWMA of the per-silence-frame peak absolute amplitude.
+	// Used as the noise floor for the energy gate that drops "speech"
+	// classified by WebRTC VAD but whose amplitude is indistinguishable
+	// from room tone — the most common source of Whisper hallucinations
+	// like "Тельно раздевать", "Хоты!", "на".
+	bgPeak float64
+
 	out chan Utterance
 	mu  sync.Mutex // serialises WriteFrame calls
 
@@ -170,7 +202,27 @@ type Segmenter struct {
 	totalFrames  atomic.Uint64
 	utterances   atomic.Uint64
 	drops        atomic.Uint64
+	energyDrops  atomic.Uint64
 }
+
+const (
+	// energyEWMAAlpha is the smoothing factor for the background-noise
+	// estimate. 0.97 over 30 ms frames means ~1 s time constant — fast
+	// enough to track room changes (fan on/off), slow enough that a
+	// single loud sample does not poison the floor.
+	energyEWMAAlpha = 0.97
+	// energyGateRatio is how many times the noise floor an utterance's
+	// peak amplitude must exceed to be considered real speech. Picked
+	// empirically: WebRTC VAD already filters obvious noise; the gate
+	// only needs to catch the borderline cases the decoder hallucinates
+	// over.
+	energyGateRatio = 5.0
+	// energyAbsFloor is the absolute minimum peak amplitude (int16)
+	// below which the utterance is rejected regardless of noise floor.
+	// Prevents a clean-room session with bgPeak ≈ 0 from accepting
+	// trivially quiet frames. 800 ≈ 2.5 % of full scale.
+	energyAbsFloor = 800
+)
 
 // New constructs a Segmenter. The Output channel is buffered (cap=4) so
 // a slow consumer back-pressures by dropping subsequent utterances when
@@ -243,6 +295,17 @@ func (s *Segmenter) processFrame(frame []int16) {
 				s.prePadN += SamplesPerFrame
 			}
 		}
+		// Track the per-frame peak as the running noise floor while
+		// nothing is speaking. EWMA so a single loud transient (door,
+		// keypress) does not raise the floor for long.
+		if !active {
+			framePeak := float64(int16PeakAbs(frame))
+			if s.bgPeak == 0 {
+				s.bgPeak = framePeak
+			} else {
+				s.bgPeak = energyEWMAAlpha*s.bgPeak + (1.0-energyEWMAAlpha)*framePeak
+			}
+		}
 		if active {
 			s.speaking = true
 			s.startedAt = time.Now()
@@ -294,6 +357,24 @@ func (s *Segmenter) processFrame(frame []int16) {
 					emitLen -= cutSamples
 				}
 			}
+		}
+		// Energy gate. WebRTC VAD classified these frames as speech
+		// but the utterance peak amplitude is too close to the running
+		// noise floor — borderline-energy utterances are precisely
+		// where Whisper invents text. Drop instead of emitting.
+		uttPeak := float64(int16PeakAbs(s.curr[:emitLen]))
+		threshold := s.bgPeak * energyGateRatio
+		if threshold < energyAbsFloor {
+			threshold = energyAbsFloor
+		}
+		if uttPeak < threshold {
+			s.energyDrops.Add(1)
+			s.speaking = false
+			s.silenceMs = 0
+			s.speechMs = 0
+			s.curr = s.curr[:0]
+			s.prePadN = 0
+			return
 		}
 		// pcm is pool-allocated; downstream consumer (stt.Pipeline)
 		// must call vad.ReleasePCM once Transcribe returns.

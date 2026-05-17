@@ -243,15 +243,18 @@ type stitchGroup struct {
 
 const (
 	// stitchWindow is how long routeMTJob waits for a follow-on
-	// utterance before flushing a no-terminal-punct group on its own.
-	// Set to ~clause→clause cadence: short enough that a real end-of-
-	// thought finalises quickly, long enough to catch the typical
-	// hand-off ("Иван Иванович… приехал вчера").
-	stitchWindow = 1200 * time.Millisecond
+	// utterance before flushing a fragment on its own. Whisper auto-
+	// punctuates every short utterance with a period, so terminal-
+	// punct cannot be a stitch-stop signal — duration is the only
+	// reliable indicator that the user finished a thought. 700 ms
+	// matches a typical clause→clause hand-off without feeling laggy
+	// on terse single-word replies.
+	stitchWindow = 700 * time.Millisecond
 	// stitchMaxUtts caps how many fragments collapse into one MT call.
-	// Anything longer than three pieces almost certainly contains a
-	// genuine clause boundary the user wants translated separately.
-	stitchMaxUtts = 3
+	// 4 covers most multi-clause utterances; beyond that the resulting
+	// MT input is long enough that an extra translate call is cheaper
+	// than risking m2m100 max_decoding_length truncation.
+	stitchMaxUtts = 4
 	// stitchMaxUttDuration skips the stitch path entirely for long
 	// utterances — a 4 s phrase already carries enough context that
 	// stitching it onto the next one would over-batch.
@@ -625,7 +628,11 @@ func (p *Pipeline) handleUtterance(ut vad.Utterance) {
 // the Event before calling here) — only translation/TTS dispatch is
 // deferred, so the user keeps seeing live text without flicker.
 func (p *Pipeline) routeMTJob(eventID uint64, text, srcLang string, speechEnd time.Time, duration time.Duration) {
-	skipStitch := endsWithTerminal(text) || duration > stitchMaxUttDuration
+	// Whisper auto-punctuates short utterances with a period regardless
+	// of whether the user actually ended a sentence, so terminal punct
+	// is unreliable as a stitch-stop signal. Use duration only:
+	// anything under stitchMaxUttDuration gets buffered for stitching.
+	skipStitch := duration > stitchMaxUttDuration
 
 	p.stitch.mu.Lock()
 	defer p.stitch.mu.Unlock()
