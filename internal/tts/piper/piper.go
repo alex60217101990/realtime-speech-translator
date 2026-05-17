@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,19 @@ import (
 	"time"
 	"unsafe"
 )
+
+// dyldStripVars are dynamic-linker overrides commonly injected by
+// version managers (gvm, conda, nix, asdf, pyenv). They shadow the
+// piper binary's @rpath / RUNPATH and prevent it from finding the
+// dylibs that ship next to it in the official release tarball. We
+// scrub them from the subprocess environment before exec.
+var dyldStripVars = []string{
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FALLBACK_LIBRARY_PATH",
+	"DYLD_INSERT_LIBRARIES",
+	"LD_LIBRARY_PATH",
+	"LD_PRELOAD",
+}
 
 // SampleRate is the sample rate Piper voices produce. All medium /
 // high-quality voices in rhasspy/piper-voices use 22050 Hz; some "low"
@@ -143,6 +157,7 @@ func (e *Engine) Synthesize(ctx context.Context, text, lang string) ([]int16, er
 		"--model", voice.ONNXPath,
 		"--output_raw",
 	)
+	cmd.Env = cleanEnv()
 	cmd.Stdin = strings.NewReader(text)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -157,6 +172,25 @@ func (e *Engine) Synthesize(ctx context.Context, text, lang string) ([]int16, er
 // Synthesize spawns its own short-lived process; reserved for future
 // long-lived process modes.
 func (e *Engine) Close() error { return nil }
+
+// cleanEnv returns the parent process environment with the dynamic-
+// linker overrides in dyldStripVars removed. Used for every piper
+// spawn so version-manager overlays (gvm, conda, nix, asdf) do not
+// shadow the piper binary's bundled dylibs.
+func cleanEnv() []string {
+	parent := os.Environ()
+	out := make([]string, 0, len(parent))
+parentLoop:
+	for _, kv := range parent {
+		for _, strip := range dyldStripVars {
+			if strings.HasPrefix(kv, strip+"=") {
+				continue parentLoop
+			}
+		}
+		out = append(out, kv)
+	}
+	return out
+}
 
 // bytesToInt16 reinterprets a raw little-endian PCM byte buffer as a
 // []int16 slice without copying. The returned slice aliases the input

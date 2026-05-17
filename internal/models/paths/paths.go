@@ -180,6 +180,50 @@ func TTSVoiceJSON(name string) (string, error) {
 	return p + ".json", nil
 }
 
+// PiperRoot is the per-OS app-data folder hosting the auto-installed
+// Piper engine. The auto-install flow creates a Python virtual env
+// inside it and pip-installs piper-tts there, so the layout is:
+//
+//	<PiperRoot>/venv/                 — Python virtualenv
+//	<PiperRoot>/venv/bin/piper        — the piper CLI wrapper (Unix)
+//	<PiperRoot>/venv/bin/python3      — the venv interpreter
+//	<PiperRoot>/venv/lib/python.../site-packages/piper_tts/...
+//
+// Rhasspy's prebuilt macOS tarballs ship without their bundled .dylib
+// files, so the pip wheel of piper-tts is the only reliable source
+// across Intel + Apple Silicon. The directory is created on demand.
+func PiperRoot() (string, error) {
+	d, err := Data()
+	if err != nil {
+		return "", err
+	}
+	root := filepath.Join(d, "piper-engine")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// PiperVenv returns the venv directory under PiperRoot.
+func PiperVenv() (string, error) {
+	root, err := PiperRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "venv"), nil
+}
+
+// PiperBinary returns the expected path of the piper executable inside
+// the auto-installed venv. May or may not exist on disk; callers
+// should Exists()-check before using it as the binary path.
+func PiperBinary() (string, error) {
+	venv, err := PiperVenv()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(venv, "bin", "piper"), nil
+}
+
 // Exists is a small convenience that hides the os.Stat dance.
 func Exists(path string) bool {
 	_, err := os.Stat(path)

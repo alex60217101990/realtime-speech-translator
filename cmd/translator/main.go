@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,7 +43,10 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
+	"github.com/alex60217101990/realtime-speech-translator/internal/tts/espeakos"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts/piper"
+	"github.com/alex60217101990/realtime-speech-translator/internal/tts/sayos"
+	"github.com/alex60217101990/realtime-speech-translator/internal/tts/wsapi"
 	"github.com/alex60217101990/realtime-speech-translator/internal/ui"
 	"github.com/alex60217101990/realtime-speech-translator/internal/vmic"
 )
@@ -184,10 +188,17 @@ func main() {
 
 	if *ttsOn {
 		pcfg := piper.DefaultConfig()
-		pcfg.BinaryPath = *piperBin
+		pcfg.BinaryPath = resolvePiperBin(*piperBin)
 		peng, err := piper.New(pcfg)
 		if err != nil {
-			slog.Warn("tts disabled", "err", err)
+			slog.Warn("piper unavailable; falling back to native TTS where possible", "err", err)
+			if fb, name, fbErr := nativeTTSFallback(cfg.TargetLang); fbErr != nil {
+				slog.Warn("tts disabled — no native fallback available",
+					"piper_err", err, "fallback_err", fbErr)
+			} else if fb != nil {
+				cfg.TTSBackend = fb
+				slog.Info("tts backend ready", "backend", name, "voice_lang", cfg.TargetLang)
+			}
 		} else {
 			// 1) explicit --voice flags first
 			for lang, p := range voices {
@@ -575,7 +586,22 @@ func main() {
 		fyne.Do(func() { renderHeader(*mtBackend) })
 		slog.Info("MT hot-reloaded", "backend", *mtBackend)
 	}
-	modelsTab := ui.ModelsScreen(w, ui.ModelsCallbacks{OnMTInstalled: onMTInstalled})
+	onPiperInstalled := func() {
+		// Hot-reloading the Piper engine into a running Session would
+		// need a SetTTS-style swap on the Pipeline (similar to ReloadMT).
+		// That is a bigger change; for now surface a clear "please
+		// restart" dialog so the user knows the install succeeded and
+		// what to do next.
+		fyne.Do(func() {
+			dialog.ShowInformation("Piper installed",
+				"Piper engine installed successfully. Restart the application to enable text-to-speech playback.",
+				w)
+		})
+	}
+	modelsTab := ui.ModelsScreen(w, ui.ModelsCallbacks{
+		OnMTInstalled:    onMTInstalled,
+		OnPiperInstalled: onPiperInstalled,
+	})
 
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Main", mainTab),
@@ -610,6 +636,18 @@ func main() {
 
 func pickPlaybackDevice(override string, cfg *rstapp.Config) (name string, kind string, missing bool) {
 	if override != "" {
+		// Recognise a handful of magic keywords that bypass the
+		// virtual-mic search and route TTS to the host's default audio
+		// output instead (i.e. real speakers). Useful for local
+		// monitoring without setting up a Multi-Output Device — the
+		// user can pick this when they want to hear the translation
+		// themselves rather than pipe it into Zoom/Meet/etc.
+		low := strings.ToLower(strings.TrimSpace(override))
+		switch low {
+		case "default", "speakers", "built-in", "builtin", "system", "host":
+			cfg.PlaybackDeviceID = nil
+			return "system default", "default", false
+		}
 		all, err := vmic.AllQuick()
 		if err != nil {
 			log.Printf("vmic: enumerate failed: %v", err)
@@ -623,7 +661,13 @@ func pickPlaybackDevice(override string, cfg *rstapp.Config) (name string, kind 
 				return all[i].Name, all[i].Kind.String(), false
 			}
 		}
-		log.Printf("vmic: --output-device %q did not match any device, falling back", override)
+		log.Printf("vmic: --output-device %q did not match any device, falling back to system default", override)
+		// Override given but no match — fall through to OS default
+		// rather than silently grabbing a random virtual mic. The user
+		// almost always meant "play it where I asked"; defaulting back
+		// to BlackHole only makes the audio inaudible.
+		cfg.PlaybackDeviceID = nil
+		return "system default", "default", false
 	}
 	found, err := vmic.DetectQuick()
 	if err != nil {
@@ -695,6 +739,110 @@ func resolveModelPath(flagVal, whisperName string) (string, error) {
 		name = "base"
 	}
 	return paths.Whisper(name)
+}
+
+// ttsCandidate pairs a slog label with a constructor returning the
+// engine plus a HasVoice probe. We can't store the engines through
+// stt.TTSEngine because that interface only exposes Synthesize +
+// Close — HasVoice lives on each concrete backend, but they all
+// implement the same shape.
+type ttsCandidate struct {
+	name  string
+	build func() (ttsCandidateEngine, error)
+}
+
+// ttsCandidateEngine is what every native backend (sayos / espeakos /
+// wsapi) implements. Each Engine has the same method set; declaring
+// the union here means the chain logic does not need to know which
+// concrete type it is dealing with.
+type ttsCandidateEngine interface {
+	stt.TTSEngine
+	HasVoice(lang string) bool
+	Close() error
+}
+
+// nativeTTSFallback constructs a per-OS native TTS engine when Piper
+// is unavailable. Order:
+//
+//   - macOS   → /usr/bin/say                (sayos)
+//   - macOS   → espeak-ng if user installed (espeakos secondary)
+//   - Linux   → espeak-ng / espeak          (espeakos)
+//   - Windows → PowerShell + SAPI           (wsapi)
+//
+// Returns the engine, a short label for slog, or an error when no
+// backend can serve the target language.
+func nativeTTSFallback(targetLang string) (stt.TTSEngine, string, error) {
+	var order []ttsCandidate
+	switch runtime.GOOS {
+	case "darwin":
+		order = append(order,
+			ttsCandidate{"sayos", func() (ttsCandidateEngine, error) { return sayos.New() }},
+			ttsCandidate{"espeakos", func() (ttsCandidateEngine, error) { return espeakos.New() }},
+		)
+	case "linux":
+		order = append(order,
+			ttsCandidate{"espeakos", func() (ttsCandidateEngine, error) { return espeakos.New() }},
+		)
+	case "windows":
+		order = append(order,
+			ttsCandidate{"wsapi", func() (ttsCandidateEngine, error) { return wsapi.New() }},
+		)
+	}
+	var lastErr error
+	for _, c := range order {
+		e, err := c.build()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !e.HasVoice(targetLang) {
+			lastErr = fmt.Errorf("%s: no default voice for %q", c.name, targetLang)
+			_ = e.Close()
+			continue
+		}
+		return e, c.name, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no native TTS backend registered for %s", runtime.GOOS)
+	}
+	return nil, "", lastErr
+}
+
+// resolvePiperBin picks the piper executable path in this order:
+//
+//  1. explicit flag/config value (verbatim, even when missing — surfaces
+//     a clear "binary not found" error to the user);
+//  2. the auto-install location populated by the Models tab
+//     (paths.PiperBinary());
+//  3. common pip user-install locations (~/Library/Python/*/bin and
+//     ~/.local/bin) — the rhasspy GitHub release tarball for macOS is
+//     currently broken (missing .dylibs), so most users fall back to
+//     `pip install --user piper-tts` and end up with a binary there;
+//  4. empty string → piper.New() falls back to a $PATH lookup so a
+//     user-supplied install on /usr/local/bin still works.
+func resolvePiperBin(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if auto, err := paths.PiperBinary(); err == nil && paths.Exists(auto) {
+		return auto
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		candidates := []string{
+			filepath.Join(home, ".local", "bin", "piper"),
+		}
+		// Pip user-install on macOS places scripts under
+		// ~/Library/Python/<ver>/bin — glob for any version.
+		pyBins, _ := filepath.Glob(filepath.Join(home, "Library", "Python", "*", "bin", "piper"))
+		candidates = append(candidates, pyBins...)
+		for _, c := range candidates {
+			if paths.Exists(c) {
+				return c
+			}
+		}
+	}
+	return ""
 }
 
 // loadMTEngine constructs the MT engine for the named backend. Returns

@@ -27,6 +27,11 @@ type ModelsCallbacks struct {
 	// running translator. Called from a goroutine — wrap UI work in
 	// fyne.Do.
 	OnMTInstalled func(backend string)
+	// OnPiperInstalled fires after the auto-install flow for the
+	// upstream piper binary completes. The parent re-resolves the TTS
+	// engine path and rebuilds piper.Engine so playback starts working
+	// without an app restart. Called from a goroutine.
+	OnPiperInstalled func()
 }
 
 // modelRow describes a single row in the Models Manager list.
@@ -199,6 +204,10 @@ func ModelsScreen(w fyne.Window, cb ModelsCallbacks) fyne.CanvasObject {
 	header := widget.NewLabelWithStyle("Models", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
 	listBox := container.NewVBox()
+	// Engine row goes first: TTS playback depends on the piper binary
+	// being installed at all, so the user should see "install me" at
+	// the very top before any voice rows.
+	listBox.Add(piperEngineRow(w, dlClient, cb.OnPiperInstalled))
 	var mu sync.Mutex
 	progressByRow := make(map[string]*widget.ProgressBar)
 	statusByRow := make(map[string]*widget.Label)

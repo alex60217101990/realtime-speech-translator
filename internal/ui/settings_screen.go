@@ -76,7 +76,7 @@ func SettingsScreen(w fyne.Window, cur config.Settings, cb SettingsCallbacks) fy
 
 	outDevEntry := widget.NewEntry()
 	outDevEntry.SetText(cur.OutputDevice)
-	outDevEntry.SetPlaceHolder("BlackHole / CABLE / rstranslator (substring)")
+	outDevEntry.SetPlaceHolder("default = system speakers · or BlackHole / CABLE / rstranslator")
 	form.Append("Output device", outDevEntry)
 
 	ttsCheck := widget.NewCheck("Speak translations", nil)

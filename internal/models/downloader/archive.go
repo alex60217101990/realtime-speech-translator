@@ -80,9 +80,36 @@ func ExtractTarGz(srcPath, destDir string) error {
 			if err := out.Close(); err != nil {
 				return err
 			}
+		case tar.TypeSymlink:
+			// The piper release tarball wires up its bundled dylibs via
+			// symlinks (libespeak-ng.1.dylib → libespeak-ng.1.51.dylib);
+			// silently skipping them breaks @rpath lookup at runtime.
+			// Resolve the link target *relative to the symlink's parent
+			// directory* and reject anything that escapes destDir so a
+			// malicious archive cannot link out via "../../etc/passwd".
+			linkRel := filepath.FromSlash(hdr.Linkname)
+			var absLink string
+			if filepath.IsAbs(linkRel) {
+				absLink = filepath.Clean(linkRel)
+			} else {
+				absLink = filepath.Clean(filepath.Join(filepath.Dir(target), linkRel))
+			}
+			if !strings.HasPrefix(absLink+string(filepath.Separator), cleanDest) &&
+				absLink != filepath.Clean(destDir) {
+				return fmt.Errorf("downloader: symlink %q escapes dest (target=%q)", hdr.Name, hdr.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			// Overwrite any existing entry — re-installs depend on this.
+			_ = os.Remove(target)
+			if err := os.Symlink(linkRel, target); err != nil {
+				return fmt.Errorf("downloader: symlink: %w", err)
+			}
 		default:
-			// Skip symlinks, hardlinks, char/block devices, fifos.
-			// Models from our CI workflow only contain regular files.
+			// Skip hardlinks, char/block devices, fifos. Models from our
+			// CI workflow only contain regular files; piper tarballs
+			// only need regular files + symlinks (handled above).
 		}
 	}
 }
