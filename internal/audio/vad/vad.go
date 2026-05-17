@@ -126,22 +126,22 @@ type Config struct {
 // blow past ~real-time × utterance even on a long monologue.
 func DefaultConfig() Config {
 	return Config{
-		// Aggressiveness 1 keeps quiet inter-word vowels classified as
-		// speech instead of carving silence out of every clause.
-		Aggressiveness: 1,
+		// Aggressiveness 2 strips most background noise. Mode 1 lets
+		// quiet breath/room tone into the PCM, which Whisper then
+		// transcribes as plausible-sounding garbage ("ревудишь",
+		// "вакуи фетилейный"). Stay strict.
+		Aggressiveness: 2,
 		MinSpeechMs:    200,
 		// 12 s gives a long monologue room to land in one utterance,
-		// preserving the InitialPrompt context across the whole
-		// thought instead of force-splitting at 6 s.
+		// preserving InitialPrompt context across the whole thought
+		// instead of force-splitting at 6 s.
 		MaxSpeechMs: 12000,
-		// 800 ms hangover covers the clause-level pauses real speakers
-		// take (mid-sentence comma, breath) without breaking the
-		// utterance. The 200 ms previous value was carved at every
-		// comma and Whisper lost the surrounding context. Trade-off:
-		// the final chunk of a long utterance shows ~600 ms later
-		// than before, but the live partial transcript keeps the UI
-		// responsive in the meantime.
-		HangoverMs: 800,
+		// 500 ms hangover catches the clause-level comma pause (~200-
+		// 400 ms) without dragging a full second of silence into the
+		// PCM that Whisper later hallucinates over. The trailing
+		// silence is also trimmed at emit time (see processFrame) so
+		// the engine sees at most ~100 ms of tail quiet.
+		HangoverMs: 500,
 		PrePadMs:   150,
 	}
 }
@@ -278,11 +278,27 @@ func (s *Segmenter) processFrame(frame []int16) {
 	}
 
 	if s.speechMs >= s.cfg.MinSpeechMs {
-		// Copy out the utterance — the internal buffer is reused.
+		// Trim trailing silence the hangover accumulated before the
+		// close: Whisper hallucinates plausible-sounding nonsense when
+		// fed audio that ends with >100 ms of room tone, so we keep a
+		// short pad and drop the rest. Only the hangover-close path
+		// has this padding to remove; max-speech force-close emits
+		// raw speech and skips the trim.
+		emitLen := len(s.curr)
+		if closeReason == "hangover" {
+			const trailingPadMs = 100
+			cutMs := s.silenceMs - trailingPadMs
+			if cutMs > 0 {
+				cutSamples := cutMs * SampleRate / 1000
+				if cutSamples < emitLen {
+					emitLen -= cutSamples
+				}
+			}
+		}
 		// pcm is pool-allocated; downstream consumer (stt.Pipeline)
 		// must call vad.ReleasePCM once Transcribe returns.
-		pcm := acquirePCM(len(s.curr))
-		copy(pcm, s.curr)
+		pcm := acquirePCM(emitLen)
+		copy(pcm, s.curr[:emitLen])
 		ut := Utterance{
 			PCM:       pcm,
 			StartedAt: s.startedAt,
