@@ -330,14 +330,13 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 		return nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
 	}
 
-	sttCfg := stt.DefaultConfig()
-	sttCfg.Tokens = tokensPath
-	sttCfg.VADModel = vadPath
-	sttCfg.NumThreads = cfg.Threads
-	sttCfg.VADThreshold = cfg.VADThreshold
-
+	// Pick the right defaults BEFORE filling paths so the per-kind
+	// DSP / endpoint / VAD knobs land correctly. We later commit
+	// the resolved Kind and paths.
+	var sttCfg stt.Config
 	switch {
 	case fileExists(filepath.Join(sttDir, "encoder.onnx")):
+		sttCfg = stt.DefaultConfig()
 		sttCfg.Kind = stt.ModelTransducer
 		sttCfg.Encoder = filepath.Join(sttDir, "encoder.onnx")
 		sttCfg.Decoder = filepath.Join(sttDir, "decoder.onnx")
@@ -348,10 +347,19 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 			}
 		}
 	case fileExists(filepath.Join(sttDir, "model.onnx")):
+		sttCfg = stt.DefaultToneCtcConfig()
 		sttCfg.Kind = stt.ModelToneCtc
 		sttCfg.ToneCtcModel = filepath.Join(sttDir, "model.onnx")
 	default:
 		return nil, nil, fmt.Errorf("%w: stt/%s/(encoder|model).onnx", errModelsMissing, cfg.STTModel)
+	}
+	sttCfg.Tokens = tokensPath
+	sttCfg.VADModel = vadPath
+	sttCfg.NumThreads = cfg.Threads
+	// Settings VAD threshold overrides per-kind default — user
+	// always wins.
+	if cfg.VADThreshold > 0 {
+		sttCfg.VADThreshold = cfg.VADThreshold
 	}
 	slog.Info("stt backend resolved",
 		"model_name", cfg.STTModel,

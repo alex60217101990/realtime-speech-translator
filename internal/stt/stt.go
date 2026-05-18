@@ -40,6 +40,8 @@ import (
 	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+
+	"github.com/alex60217101990/realtime-speech-translator/internal/audio/dsp"
 )
 
 // ModelKind selects which streaming online recognizer configuration
@@ -122,10 +124,37 @@ type Config struct {
 	// adds nothing to the log-mel spectrogram and visibly improves
 	// CTC accuracy on cheap built-in laptop microphones.
 	EnablePreEmphasis bool
+
+	// TelephonyBandpass applies a 300–3400 Hz Butterworth band-pass
+	// (cascaded HP+LP biquads) before AcceptWaveform. Required for
+	// T-one to perform well on 16 kHz mic input: T-one was trained
+	// on G.711 telephony audio, so the model expects exactly that
+	// narrow spectral envelope. Without it the wide-band signal
+	// looks out-of-distribution and the CTC head hallucinates
+	// fragments and drops first / last phonemes.
+	TelephonyBandpass bool
+
+	// PreEmphasisAlpha enables a 1-tap FIR pre-emphasis
+	// y[n] = x[n] − α·x[n−1] when > 0. 0.97 is the textbook value
+	// (every Whisper / wav2vec frontend uses it under the hood);
+	// surfacing it here makes CTC consonant recognition noticeably
+	// better on cheap mics. 0 disables.
+	PreEmphasisAlpha float32
+
+	// EnableAGC turns on a streaming rolling-RMS automatic gain
+	// control that nudges chunks toward AGCTargetRMS. Important for
+	// T-one: telephony training data is loudness-normalised, our
+	// mic input often isn't, and the model's CTC head behaves much
+	// better at telephony-typical level (~-20 dBFS RMS).
+	EnableAGC      bool
+	AGCTargetRMS   float32 // default 0.10 (~-20 dBFS)
+	AGCMaxGain     float32 // default 8
+	AGCMinRMS      float32 // default 0.005 (below = silence)
 }
 
-// DefaultConfig returns recommended defaults for realtime mic capture.
-// Caller fills the model paths.
+// DefaultConfig returns recommended defaults for the streaming
+// Zipformer transducer path. Caller fills the model paths and may
+// call DefaultToneCtcConfig instead when the loaded model is T-one.
 func DefaultConfig() Config {
 	return Config{
 		SampleRate:                 16000,
@@ -145,6 +174,57 @@ func DefaultConfig() Config {
 		MaxActivePaths:             4,
 		EnablePreEmphasis:          true,
 	}
+}
+
+// DefaultToneCtcConfig returns defaults tuned for T-one streaming
+// CTC on 16 kHz mic input. The differences from DefaultConfig are
+// all about matching T-one's narrow-band telephony training:
+//
+//   - Telephony band-pass 300–3400 Hz before AcceptWaveform.
+//   - Pre-emphasis α=0.97 on top of the band-pass to boost the
+//     unvoiced consonants the CTC head most often drops.
+//   - AGC nudges level toward -20 dBFS (telephony-typical).
+//   - Generic Whisper-style 100 Hz HPF is off — the band-pass
+//     supersedes it (HP 300 Hz is strictly stricter than HP 100 Hz).
+//   - Endpoint and VAD tightened: shorter trailing-silence rule,
+//     shorter max segment, slightly more aggressive VAD threshold.
+//     These ride T-one's own ~330 ms emission latency so we close
+//     phrases earlier without cutting off slow speakers.
+func DefaultToneCtcConfig() Config {
+	c := DefaultConfig()
+
+	// Decoder: T-one is a streaming CTC model. modified_beam_search
+	// is rejected by sherpa for streaming CTC; the constructor
+	// forces greedy regardless, but set it explicitly so the
+	// Config is honest about what runs.
+	c.DecodingMethod = "greedy_search"
+	c.MaxActivePaths = 0
+
+	// VAD: stricter gate so background noise does not start an
+	// utterance the CTC head will turn into a fragment.
+	c.VADThreshold = 0.55
+	c.VADMinSilenceSec = 0.30
+	c.VADMinSpeechSec = 0.20
+
+	// Endpoint: T-one publishes ~330 ms emission latency + 600 ms
+	// silence detector internally. Pair with tighter Rules so
+	// sherpa closes phrases at roughly that boundary.
+	c.Rule1MinTrailingSilenceSec = 1.0
+	c.Rule2MinTrailingSilenceSec = 0.6
+	c.Rule3MinUtteranceLengthSec = 10
+
+	// Telephony spectral match.
+	c.TelephonyBandpass = true
+	c.PreEmphasisAlpha = 0.97
+	c.EnablePreEmphasis = false // superseded by the BP's HP 300
+
+	// Level normalisation toward telephony-typical -20 dBFS.
+	c.EnableAGC = true
+	c.AGCTargetRMS = 0.10
+	c.AGCMaxGain = 8
+	c.AGCMinRMS = 0.005
+
+	return c
 }
 
 // Event is anything an STT backend emits to its consumer. Use a type
@@ -213,6 +293,12 @@ type Engine struct {
 	// across chunks). Only touched from the Run goroutine.
 	hpPrevX float32
 	hpPrevY float32
+
+	// DSP chain — only the blocks the Config asked for are
+	// non-nil. Stateful, owned by the Run goroutine.
+	bandpass *dsp.Bandpass
+	preEmph  *dsp.PreEmphasis
+	agc      *dsp.AGC
 
 	closeOnce sync.Once
 }
@@ -355,13 +441,27 @@ func New(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("stt: failed to construct VoiceActivityDetector (check vad model)")
 	}
 
-	return &Engine{
+	e := &Engine{
 		cfg:     cfg,
 		rec:     rec,
 		vad:     vad,
 		audioCh: make(chan []float32, cfg.AudioBufferFrames),
 		eventCh: make(chan Event, 32),
-	}, nil
+	}
+	if cfg.TelephonyBandpass {
+		e.bandpass = dsp.NewTelephonyBandpass(cfg.SampleRate)
+	}
+	if cfg.PreEmphasisAlpha > 0 {
+		e.preEmph = &dsp.PreEmphasis{Alpha: cfg.PreEmphasisAlpha}
+	}
+	if cfg.EnableAGC {
+		e.agc = &dsp.AGC{
+			TargetRMS: cfg.AGCTargetRMS,
+			MaxGain:   cfg.AGCMaxGain,
+			MinRMS:    cfg.AGCMinRMS,
+		}
+	}
+	return e, nil
 }
 
 // Push hands a chunk of 16 kHz mono float32 audio to the engine. It
@@ -438,8 +538,19 @@ func (e *Engine) Run(ctx context.Context) {
 				continue
 			}
 
+			// DSP chain — order matters: band-shape first so the
+			// pre-emphasis and AGC work on the in-band signal.
 			if e.cfg.EnablePreEmphasis {
 				e.highPass100Hz(samples)
+			}
+			if e.bandpass != nil {
+				e.bandpass.ProcessInPlace(samples)
+			}
+			if e.preEmph != nil {
+				e.preEmph.ProcessInPlace(samples)
+			}
+			if e.agc != nil {
+				e.agc.ProcessInPlace(samples)
 			}
 			stream.AcceptWaveform(e.cfg.SampleRate, samples)
 			inSegment = true
