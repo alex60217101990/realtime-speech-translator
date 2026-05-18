@@ -26,6 +26,7 @@ const (
 	KindSTT Kind = "stt"
 	KindVAD Kind = "vad"
 	KindTTS Kind = "tts"
+	KindMT  Kind = "mt"
 )
 
 // Entry describes one downloadable model artefact. The Installer
@@ -54,9 +55,14 @@ type Entry struct {
 	// exist for the entry to count as installed.
 	RequiredFiles []string
 
+	// BackendName is the value the cmd layer should write into
+	// config.MTBackend when this MT entry is installed (e.g.
+	// "m2m100", "small100", "opusmt"). Ignored for non-MT entries.
+	BackendName string
+
 	// pathFn yields the install root; nil for entries that map onto
-	// the canonical paths.STTDir / paths.TTSDir / paths.VADModel
-	// directories (default behaviour, see InstallDir).
+	// the canonical paths.STTDir / paths.TTSDir / paths.VADModel /
+	// paths.MTDir directories (default behaviour, see InstallDir).
 	pathFn func() (string, error)
 }
 
@@ -71,6 +77,8 @@ func (e Entry) InstallDir() (string, error) {
 		return paths.STTDir(e.Name)
 	case KindTTS:
 		return paths.TTSDir(e.Name)
+	case KindMT:
+		return paths.MTDir(e.Name)
 	case KindVAD:
 		// Silero lives at <models>/vad/silero_vad.onnx — return the
 		// parent directory and let the installer write the file at
@@ -155,7 +163,7 @@ func DefaultCatalog() []Entry {
 		{
 			Kind:        KindTTS,
 			Name:        "piper-en-amy-low",
-			DisplayName: "Piper en_US Amy (low)",
+			DisplayName: "Piper en_US Amy (low, English)",
 			License:     "MIT (Piper) + GPL-3.0 (espeak-ng)",
 			URL:         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low.tar.bz2",
 			SizeBytes:   67_095_344,
@@ -167,6 +175,42 @@ func DefaultCatalog() []Entry {
 			},
 			RequiredFiles: []string{
 				"model.onnx", "tokens.txt", "espeak-ng-data",
+			},
+		},
+		{
+			Kind:        KindTTS,
+			Name:        "piper-ru-irina-medium",
+			DisplayName: "Piper ru_RU Irina (medium, Russian)",
+			License:     "MIT (Piper) + GPL-3.0 (espeak-ng)",
+			URL:         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ru_RU-irina-medium.tar.bz2",
+			SizeBytes:   67_153_308,
+			Tarball:     true,
+			Layout: map[string]string{
+				"ru_RU-irina-medium.onnx": "model.onnx",
+				"tokens.txt":              "tokens.txt",
+				"espeak-ng-data":          "espeak-ng-data",
+			},
+			RequiredFiles: []string{
+				"model.onnx", "tokens.txt", "espeak-ng-data",
+			},
+		},
+		{
+			Kind:        KindMT,
+			Name:        "m2m100-418m-int8",
+			DisplayName: "M2M-100 418M int8 (100 languages, CT2)",
+			License:     "MIT (Facebook M2M-100)",
+			URL:         "https://github.com/alex60217101990/realtime-speech-translator/releases/download/models-v1/m2m100-418m-int8.tar.gz",
+			SizeBytes:   460_864_138,
+			Tarball:     true,
+			BackendName: "m2m100",
+			Layout: map[string]string{
+				"model.bin":               "model.bin",
+				"config.json":             "config.json",
+				"shared_vocabulary.json":  "shared_vocabulary.json",
+				"sentencepiece.bpe.model": "sentencepiece.bpe.model",
+			},
+			RequiredFiles: []string{
+				"model.bin", "config.json", "sentencepiece.bpe.model",
 			},
 		},
 	}

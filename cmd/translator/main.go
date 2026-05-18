@@ -156,6 +156,11 @@ func main() {
 			case models.KindTTS:
 				cfg.TTSVoice = e.Name
 				_ = config.Save(cfg)
+			case models.KindMT:
+				if e.BackendName != "" {
+					cfg.MTBackend = e.BackendName
+					_ = config.Save(cfg)
+				}
 			}
 			rebuildSettings()
 			if tryStart != nil {
@@ -618,12 +623,18 @@ func buildMT(cfg config.Settings) (mt.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	sm, err := paths.MTDir("small100")
+	sm, err := paths.MTDir("small100-int8")
+	if err != nil {
+		return nil, err
+	}
+	m2m, err := paths.MTDir("m2m100-418m-int8")
 	if err != nil {
 		return nil, err
 	}
 	return mt.Build(mt.FactoryConfig{
 		Backend:          cfg.MTBackend,
+		M2M100ModelDir:   m2m,
+		M2M100SPModel:    filepath.Join(m2m, "sentencepiece.bpe.model"),
 		SMaLL100ModelDir: sm,
 		SMaLL100SPModel:  filepath.Join(sm, "sentencepiece.bpe.model"),
 		OPUSMTRoot:       root,

@@ -9,10 +9,16 @@ import (
 // resolved paths come from internal/paths plus config.Settings.
 type FactoryConfig struct {
 	// Backend selects the implementation. Valid values:
+	//   "m2m100"   — facebook/m2m100_418M, original tag scheme
+	//                (requires -tags mt).
 	//   "small100" — distilled M2M-100 (requires -tags mt).
 	//   "opusmt"   — per-pair Helsinki-NLP (requires -tags mt).
 	//   "off"      — Disabled passthrough.
 	Backend string
+
+	// M2M-100 paths.
+	M2M100ModelDir string
+	M2M100SPModel  string
 
 	// SMaLL-100 paths.
 	SMaLL100ModelDir string
