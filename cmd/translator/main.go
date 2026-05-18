@@ -223,10 +223,60 @@ func main() {
 	}
 
 	ctl := liveCtl
+
+	// Start/Stop toggle: button text + behaviour switches based on
+	// whether we currently own a running session.
+	stopSession := func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if state.session == nil {
+			return
+		}
+		slog.Info("ui: stop button — tearing down session")
+		_ = state.session.Stop()
+		_ = state.session.Close()
+		state = sessionState{}
+		fyne.Do(func() {
+			ctl.currentStatus = "stopped"
+			ctl.startBtn.SetText("Start")
+			ctl.partial.SetText("")
+			refreshStatusBlock(ctl, rstapp.Stats{})
+		})
+	}
+
 	ctl.startBtn.OnTapped = func() {
+		stateMu.Lock()
+		running := state.session != nil
+		stateMu.Unlock()
+		if running {
+			stopSession()
+			return
+		}
+		slog.Info("ui: start button — bringing up session")
 		ctl.currentStatus = "starting"
 		ctl.partial.SetText("")
 		tryStart()
+	}
+
+	// Reflect post-tryStart state in the button label.
+	refreshStartBtnFromState := func() {
+		fyne.Do(func() {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			if state.session != nil {
+				ctl.startBtn.SetText("Stop")
+			} else {
+				ctl.startBtn.SetText("Start")
+			}
+		})
+	}
+	_ = refreshStartBtnFromState // referenced inside tryStart below
+
+	// Wrap tryStart to also flip the button.
+	innerTryStart := tryStart
+	tryStart = func() {
+		innerTryStart()
+		refreshStartBtnFromState()
 	}
 
 	tryStart()

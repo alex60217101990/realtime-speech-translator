@@ -231,6 +231,14 @@ func (s *Session) Start(ctx context.Context) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return errors.New("app: already started")
 	}
+	s.log.Info("session starting",
+		"source", s.cfg.Source,
+		"target", s.cfg.Target,
+		"tts_enabled", s.cfg.TTSEnabled,
+		"mt_engine", fmt.Sprintf("%T", s.mt),
+		"mt_queue", s.cfg.MTQueue,
+		"tts_queue", s.cfg.TTSQueue,
+	)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -255,6 +263,11 @@ func (s *Session) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go s.runTTS(runCtx)
 	}
+
+	// Heartbeat — periodic info log so the console always shows a
+	// pulse, even on a silent room.
+	s.wg.Add(1)
+	go s.heartbeat(runCtx)
 
 	if s.cfg.TTSEnabled {
 		if err := s.pb.Start(); err != nil {
@@ -296,8 +309,10 @@ func (s *Session) routeSTT(ctx context.Context) {
 			}
 			switch e := ev.(type) {
 			case stt.Partial:
+				s.log.Debug("stt partial", "text", trunc(e.Text, 80))
 				s.emit(ctx, Partial{Text: e.Text})
 			case stt.Final:
+				s.log.Info("stt final", "text", trunc(e.Text, 120))
 				s.emit(ctx, Final{Text: e.Text})
 				select {
 				case s.mtQ <- e.Text:
@@ -330,11 +345,20 @@ func (s *Session) runMT(ctx context.Context) {
 			}
 			start := time.Now()
 			tgt, err := s.mt.Translate(src, s.cfg.Source, s.cfg.Target)
-			s.mtLastNs.Store(uint64(time.Since(start).Nanoseconds()))
+			elapsed := time.Since(start)
+			s.mtLastNs.Store(uint64(elapsed.Nanoseconds()))
 			if err != nil {
+				s.log.Warn("mt translate failed", "src", trunc(src, 60), "err", err)
 				s.emit(ctx, ErrorEv{Err: fmt.Errorf("mt: %w", err)})
 				continue
 			}
+			s.log.Info("mt translation",
+				"src_lang", s.cfg.Source,
+				"tgt_lang", s.cfg.Target,
+				"src", trunc(src, 80),
+				"tgt", trunc(tgt, 80),
+				"ms", elapsed.Milliseconds(),
+			)
 			s.emit(ctx, Translation{Source: src, Target: tgt})
 
 			if !s.cfg.TTSEnabled || tgt == "" {
@@ -369,13 +393,22 @@ func (s *Session) runTTS(ctx context.Context) {
 			if text == "" {
 				continue
 			}
+			s.log.Debug("tts speak", "text", trunc(text, 60))
 			s.emit(ctx, Speaking{Active: true})
 			start := time.Now()
 			chunks := s.tts.Speak(ctx, text)
+			var totalSamples int
 			for chunk := range chunks {
+				totalSamples += len(chunk.Samples)
 				s.pumpToPlayback(ctx, chunk.Samples)
 			}
-			s.ttsLastNs.Store(uint64(time.Since(start).Nanoseconds()))
+			elapsed := time.Since(start)
+			s.ttsLastNs.Store(uint64(elapsed.Nanoseconds()))
+			s.log.Info("tts done",
+				"text", trunc(text, 60),
+				"samples", totalSamples,
+				"ms", elapsed.Milliseconds(),
+			)
 			s.emit(ctx, Speaking{Active: false})
 		}
 	}
@@ -460,6 +493,31 @@ func (s *Session) Close() error {
 		_ = s.mt.Close()
 	}
 	return nil
+}
+
+// heartbeat logs a one-line summary every 30 s so a quiet session
+// still produces visible output in the console.
+func (s *Session) heartbeat(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			st := s.Stats()
+			s.log.Info("heartbeat",
+				"captured_s", int(st.Captured.Seconds()),
+				"mic_pct", st.MicPct,
+				"vad_active_pct", st.VADActivePct,
+				"utts", st.Utterances,
+				"drops_mt", st.MTDropped,
+				"drops_tts", st.TTSDropped,
+				"underruns", st.PlaybackUnderrn,
+			)
+		}
+	}
 }
 
 // Stats is a snapshot of operational counters surfaced to the UI.
