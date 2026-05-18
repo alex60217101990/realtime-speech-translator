@@ -4,6 +4,7 @@ package mt
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt/ct2"
@@ -28,13 +29,19 @@ type SMaLL100Config struct {
 }
 
 // DefaultSMaLL100Config returns a Config tuned for low-latency CPU.
+// See DefaultM2M100Config for the same threads / MaxDecodingLength
+// rationale.
 func DefaultSMaLL100Config(modelDir, spModel string) SMaLL100Config {
+	t := runtime.NumCPU() / 2
+	if t < 2 {
+		t = 2
+	}
 	return SMaLL100Config{
 		ModelDir:           modelDir,
 		SentencePieceModel: spModel,
 		BeamSize:           1,
-		MaxDecodingLength:  256,
-		Threads:            0,
+		MaxDecodingLength:  128,
+		Threads:            t,
 		ComputeType:        ct2.ComputeInt8,
 	}
 }

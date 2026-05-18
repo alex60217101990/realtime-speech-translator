@@ -4,6 +4,7 @@ package mt
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt/ct2"
@@ -26,13 +27,27 @@ type M2M100Config struct {
 }
 
 // DefaultM2M100Config returns a Config tuned for low-latency CPU.
+//
+// Threads defaults to max(NumCPU/2, 2): with Threads=0 the CT2
+// shim picks 1, which on m2m100-418M turns a 2-second translation
+// into a 47-second one and routinely collapses the decoder into
+// "and and and …" loops because the beam search runs out of steam.
+//
+// MaxDecodingLength capped at 128 — the loop-collapse pathology
+// can still happen on adversarial inputs; bounding the output
+// stops a runaway from wasting tens of seconds before we get a
+// usable signal that something is wrong.
 func DefaultM2M100Config(modelDir, spModel string) M2M100Config {
+	t := runtime.NumCPU() / 2
+	if t < 2 {
+		t = 2
+	}
 	return M2M100Config{
 		ModelDir:           modelDir,
 		SentencePieceModel: spModel,
 		BeamSize:           1,
-		MaxDecodingLength:  256,
-		Threads:            0,
+		MaxDecodingLength:  128,
+		Threads:            t,
 		ComputeType:        ct2.ComputeInt8,
 	}
 }
