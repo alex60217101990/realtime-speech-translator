@@ -66,9 +66,9 @@ type Settings struct {
 // Default returns the factory defaults used on first launch.
 func Default() Settings {
 	return Settings{
-		SourceLang:   "auto",
+		SourceLang:   "ru",
 		TargetLang:   "en",
-		STTModel:     "zipformer-streaming-en",
+		STTModel:     "streaming-t-one-russian",
 		MTBackend:    "small100",
 		TTSVoice:     "piper-en-amy-low",
 		Threads:      0,

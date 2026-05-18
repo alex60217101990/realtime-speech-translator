@@ -319,33 +319,44 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("vad path: %w", err)
 	}
-	// Verify the STT + VAD artefacts exist BEFORE handing them to
-	// sherpa-onnx. Without this, every launch with missing files
-	// surfaces a noisy "Errors in config!" from the C side and
-	// hides the actionable signal for the user.
-	sttFiles := map[string]string{
-		"encoder.onnx": filepath.Join(sttDir, "encoder.onnx"),
-		"decoder.onnx": filepath.Join(sttDir, "decoder.onnx"),
-		"joiner.onnx":  filepath.Join(sttDir, "joiner.onnx"),
-		"tokens.txt":   filepath.Join(sttDir, "tokens.txt"),
-	}
-	for leaf, path := range sttFiles {
-		if _, err := os.Stat(path); err != nil {
-			return nil, nil, fmt.Errorf("%w: stt/%s/%s", errModelsMissing, cfg.STTModel, leaf)
-		}
+	// Detect ModelKind by which files are on disk. Transducer
+	// families ship encoder/decoder/joiner; T-one (CTC) ships a
+	// single model.onnx.
+	tokensPath := filepath.Join(sttDir, "tokens.txt")
+	if _, err := os.Stat(tokensPath); err != nil {
+		return nil, nil, fmt.Errorf("%w: stt/%s/tokens.txt", errModelsMissing, cfg.STTModel)
 	}
 	if _, err := os.Stat(vadPath); err != nil {
 		return nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
 	}
 
 	sttCfg := stt.DefaultConfig()
-	sttCfg.Encoder = sttFiles["encoder.onnx"]
-	sttCfg.Decoder = sttFiles["decoder.onnx"]
-	sttCfg.Joiner = sttFiles["joiner.onnx"]
-	sttCfg.Tokens = sttFiles["tokens.txt"]
+	sttCfg.Tokens = tokensPath
 	sttCfg.VADModel = vadPath
 	sttCfg.NumThreads = cfg.Threads
 	sttCfg.VADThreshold = cfg.VADThreshold
+
+	switch {
+	case fileExists(filepath.Join(sttDir, "encoder.onnx")):
+		sttCfg.Kind = stt.ModelTransducer
+		sttCfg.Encoder = filepath.Join(sttDir, "encoder.onnx")
+		sttCfg.Decoder = filepath.Join(sttDir, "decoder.onnx")
+		sttCfg.Joiner = filepath.Join(sttDir, "joiner.onnx")
+		for _, leaf := range []string{"decoder.onnx", "joiner.onnx"} {
+			if !fileExists(filepath.Join(sttDir, leaf)) {
+				return nil, nil, fmt.Errorf("%w: stt/%s/%s", errModelsMissing, cfg.STTModel, leaf)
+			}
+		}
+	case fileExists(filepath.Join(sttDir, "model.onnx")):
+		sttCfg.Kind = stt.ModelToneCtc
+		sttCfg.ToneCtcModel = filepath.Join(sttDir, "model.onnx")
+	default:
+		return nil, nil, fmt.Errorf("%w: stt/%s/(encoder|model).onnx", errModelsMissing, cfg.STTModel)
+	}
+	slog.Info("stt backend resolved",
+		"model_name", cfg.STTModel,
+		"kind", sttKindName(sttCfg.Kind),
+	)
 
 	var ttsCfg tts.Config
 	ttsEnabled := cfg.TTSEnabled
@@ -389,6 +400,23 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 		return nil, nil, err
 	}
 	return sess, nativeFallback, nil
+}
+
+// fileExists is the obvious helper; the os.Stat dance reads poorly
+// in switch arms.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func sttKindName(k stt.ModelKind) string {
+	switch k {
+	case stt.ModelTransducer:
+		return "transducer"
+	case stt.ModelToneCtc:
+		return "tone_ctc"
+	}
+	return "unknown"
 }
 
 // piperVoiceComplete returns true when the directory contains the

@@ -42,14 +42,41 @@ import (
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
+// ModelKind selects which streaming online recognizer configuration
+// the engine fills in. New backends should add a new value here so
+// the rest of the package stays one switch wide.
+type ModelKind int
+
+const (
+	// ModelTransducer is the streaming Zipformer transducer family
+	// (encoder + decoder + joiner). The English published model
+	// `sherpa-onnx-streaming-zipformer-en-2023-06-26` uses this.
+	ModelTransducer ModelKind = iota
+	// ModelToneCtc is the T-one CTC family (one .onnx file). The
+	// Russian published model
+	// `sherpa-onnx-streaming-t-one-russian-2025-09-08` uses this.
+	// Conformer + CTC, 71.6 M params, 300 ms chunks, ~1.2 s total
+	// latency; trained on telephony but works on 16 kHz mic input.
+	ModelToneCtc
+)
+
 // Config is the engine configuration. Paths are mandatory; numeric
 // knobs default to sensible values when zero via DefaultConfig().
 type Config struct {
-	// Streaming Zipformer transducer paths.
+	// Kind picks the recognizer family. Zero value =
+	// ModelTransducer (Zipformer).
+	Kind ModelKind
+
+	// Transducer (Zipformer) paths — used when Kind == ModelTransducer.
 	Encoder string
 	Decoder string
 	Joiner  string
-	Tokens  string
+
+	// ToneCtcModel — single .onnx, used when Kind == ModelToneCtc.
+	ToneCtcModel string
+
+	// Tokens is shared by every recognizer family.
+	Tokens string
 
 	// Silero VAD model path.
 	VADModel string
@@ -102,12 +129,14 @@ func DefaultConfig() Config {
 	}
 }
 
-// Event is anything the engine emits to its consumer. Use a type
+// Event is anything an STT backend emits to its consumer. Use a type
 // switch on the receiving end.
 type Event interface{ isSTTEvent() }
 
 // Partial is the current best transcript for an in-flight utterance.
 // It can change every frame; the consumer is expected to overwrite.
+// Streaming backends emit Partials; offline-per-segment backends
+// emit only Finals.
 type Partial struct{ Text string }
 
 // Final is the closed transcript of a finished utterance. The
@@ -117,6 +146,36 @@ type Final struct{ Text string }
 
 func (Partial) isSTTEvent() {}
 func (Final) isSTTEvent()   {}
+
+// Backend is the contract every concrete STT engine satisfies. The
+// streaming Zipformer (this package's Engine) and the VAD + offline
+// Whisper variant (internal/stt/vadwhisper) both implement it. The
+// rstapp.Session field is typed as Backend so the cmd layer picks
+// the implementation per configuration.
+type Backend interface {
+	// Run blocks while the backend processes audio. Returns when
+	// ctx cancels or Close is called. Only one Run per Backend.
+	Run(ctx context.Context)
+	// Push hands a chunk of 16 kHz mono float32 audio to the
+	// backend. Must be non-blocking.
+	Push(samples []float32)
+	// Events is the read end of the event stream. Closes when Run
+	// returns.
+	Events() <-chan Event
+	// Close releases the underlying native resources. Safe to call
+	// multiple times.
+	Close() error
+
+	// Stats surface for the UI status line. All three are safe to
+	// call from any goroutine.
+	Dropped() uint64
+	Utterances() uint64
+	VADActiveRatio() float32
+}
+
+// Compile-time assertion that the streaming Engine satisfies the
+// Backend contract.
+var _ Backend = (*Engine)(nil)
 
 // Engine is the live speech-to-text pipeline. Use New + Run + Push.
 type Engine struct {
@@ -151,8 +210,20 @@ func (e *Engine) VADActiveRatio() float32 {
 // New constructs an Engine and loads the underlying ONNX models. The
 // caller must invoke Close to release native resources.
 func New(cfg Config) (*Engine, error) {
-	if cfg.Encoder == "" || cfg.Decoder == "" || cfg.Joiner == "" || cfg.Tokens == "" {
-		return nil, errors.New("stt: encoder/decoder/joiner/tokens path required")
+	switch cfg.Kind {
+	case ModelTransducer:
+		if cfg.Encoder == "" || cfg.Decoder == "" || cfg.Joiner == "" {
+			return nil, errors.New("stt: encoder/decoder/joiner path required for transducer")
+		}
+	case ModelToneCtc:
+		if cfg.ToneCtcModel == "" {
+			return nil, errors.New("stt: tone-ctc model path required")
+		}
+	default:
+		return nil, fmt.Errorf("stt: unknown ModelKind %d", cfg.Kind)
+	}
+	if cfg.Tokens == "" {
+		return nil, errors.New("stt: tokens path required")
 	}
 	if cfg.VADModel == "" {
 		return nil, errors.New("stt: vad model path required")
@@ -177,18 +248,27 @@ func New(cfg Config) (*Engine, error) {
 		cfg.VADBufferSeconds = 60
 	}
 
+	modelCfg := sherpa.OnlineModelConfig{
+		Tokens:     cfg.Tokens,
+		NumThreads: cfg.NumThreads,
+		Provider:   cfg.Provider,
+	}
+	switch cfg.Kind {
+	case ModelTransducer:
+		modelCfg.Transducer = sherpa.OnlineTransducerModelConfig{
+			Encoder: cfg.Encoder,
+			Decoder: cfg.Decoder,
+			Joiner:  cfg.Joiner,
+		}
+	case ModelToneCtc:
+		modelCfg.ToneCtc = sherpa.OnlineToneCtcModelConfig{
+			Model: cfg.ToneCtcModel,
+		}
+	}
+
 	recCfg := sherpa.OnlineRecognizerConfig{
-		FeatConfig: sherpa.FeatureConfig{SampleRate: cfg.SampleRate, FeatureDim: 80},
-		ModelConfig: sherpa.OnlineModelConfig{
-			Transducer: sherpa.OnlineTransducerModelConfig{
-				Encoder: cfg.Encoder,
-				Decoder: cfg.Decoder,
-				Joiner:  cfg.Joiner,
-			},
-			Tokens:     cfg.Tokens,
-			NumThreads: cfg.NumThreads,
-			Provider:   cfg.Provider,
-		},
+		FeatConfig:              sherpa.FeatureConfig{SampleRate: cfg.SampleRate, FeatureDim: 80},
+		ModelConfig:             modelCfg,
 		DecodingMethod:          "greedy_search",
 		EnableEndpoint:          1,
 		Rule1MinTrailingSilence: cfg.Rule1MinTrailingSilenceSec,

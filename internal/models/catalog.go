@@ -121,6 +121,22 @@ func DefaultCatalog() []Entry {
 			},
 		},
 		{
+			Kind:        KindSTT,
+			Name:        "streaming-t-one-russian",
+			DisplayName: "T-one Streaming (Russian)",
+			License:     "Apache-2.0 (Voicekit T-Software DC)",
+			URL:         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-t-one-russian-2025-09-08.tar.bz2",
+			SizeBytes:   128_468_156,
+			Tarball:     true,
+			Layout: map[string]string{
+				"model.onnx": "model.onnx",
+				"tokens.txt": "tokens.txt",
+			},
+			RequiredFiles: []string{
+				"model.onnx", "tokens.txt",
+			},
+		},
+		{
 			Kind:        KindTTS,
 			Name:        "piper-en-amy-low",
 			DisplayName: "Piper en_US Amy (low)",

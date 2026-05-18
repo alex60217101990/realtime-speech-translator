@@ -12,13 +12,23 @@ func TestNew_MissingPathsRejected(t *testing.T) {
 		want string
 	}{
 		{
-			name: "no encoder",
-			cfg:  Config{Decoder: "d", Joiner: "j", Tokens: "t", VADModel: "v"},
-			want: "encoder/decoder/joiner/tokens",
+			name: "transducer missing encoder",
+			cfg:  Config{Kind: ModelTransducer, Decoder: "d", Joiner: "j", Tokens: "t", VADModel: "v"},
+			want: "encoder/decoder/joiner",
+		},
+		{
+			name: "transducer missing tokens",
+			cfg:  Config{Kind: ModelTransducer, Encoder: "e", Decoder: "d", Joiner: "j", VADModel: "v"},
+			want: "tokens",
+		},
+		{
+			name: "tone_ctc missing model",
+			cfg:  Config{Kind: ModelToneCtc, Tokens: "t", VADModel: "v"},
+			want: "tone-ctc model",
 		},
 		{
 			name: "no vad",
-			cfg:  Config{Encoder: "e", Decoder: "d", Joiner: "j", Tokens: "t"},
+			cfg:  Config{Kind: ModelTransducer, Encoder: "e", Decoder: "d", Joiner: "j", Tokens: "t"},
 			want: "vad model",
 		},
 	}
@@ -34,6 +44,13 @@ func TestNew_MissingPathsRejected(t *testing.T) {
 				t.Fatalf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestModelKindNames(t *testing.T) {
+	// Compile-time sanity that the constants stay distinct.
+	if ModelTransducer == ModelToneCtc {
+		t.Fatal("ModelKind constants must be distinct")
 	}
 }
 
