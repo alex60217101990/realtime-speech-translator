@@ -425,32 +425,84 @@ func (s *Session) runTTS(ctx context.Context) {
 			start := time.Now()
 			chunks := s.tts.Speak(ctx, text)
 			var totalSamples int
-			for chunk := range chunks {
-				totalSamples += len(chunk.Samples)
-				s.pumpToPlayback(ctx, chunk.Samples)
-				// Refresh the half-duplex mute on every chunk: we
-				// know we will play at least this many more samples,
-				// so push the mute deadline forward by that much
-				// plus a 400 ms tail for the loudspeaker → mic
-				// transit and the ring still draining.
-				sr := s.tts.SampleRate()
-				if sr > 0 {
-					playMs := int64(len(chunk.Samples)) * 1000 / int64(sr)
-					deadline := time.Now().Add(time.Duration(playMs+400) * time.Millisecond)
+
+			// Refresh the half-duplex mute on every chunk based on
+			// the REAL number of samples sitting in the playback
+			// ring + a 700 ms loudspeaker→mic transit grace. This
+			// is the only honest way to keep the gate active for
+			// the entire audible playback — `time.Since(start)`
+			// undercounts because the ring lags synthesis.
+			refreshMute := func() {
+				if s.pb == nil {
+					return
+				}
+				sr := s.pb.SampleRate()
+				if sr <= 0 {
+					return
+				}
+				ringSamples := s.pb.Ring().Len()
+				drainMs := int64(ringSamples) * 1000 / int64(sr)
+				deadline := time.Now().Add(time.Duration(drainMs+700) * time.Millisecond)
+				cur := s.muteUntilNs.Load()
+				if deadline.UnixNano() > cur {
 					s.muteUntilNs.Store(deadline.UnixNano())
 				}
 			}
+
+			for chunk := range chunks {
+				totalSamples += len(chunk.Samples)
+				s.pumpToPlayback(ctx, chunk.Samples)
+				refreshMute()
+			}
 			elapsed := time.Since(start)
 			s.ttsLastNs.Store(uint64(elapsed.Nanoseconds()))
-			// Final mute hold-down so the tail of playback still
-			// drains without feeding back into STT.
-			s.muteUntilNs.Store(time.Now().Add(500 * time.Millisecond).UnixNano())
+
+			// Final hold-down: keep the gate active until the ring
+			// is provably empty + 700 ms. Poll every 50 ms so we
+			// release the mic the moment playback finishes.
+			s.waitPlaybackDrain(ctx, 700*time.Millisecond)
+
 			s.log.Info("tts done",
 				"text", trunc(text, 60),
 				"samples", totalSamples,
 				"ms", elapsed.Milliseconds(),
 			)
 			s.emit(ctx, Speaking{Active: false})
+		}
+	}
+}
+
+// waitPlaybackDrain blocks until the playback ring is empty (i.e.
+// the device callback consumed every sample we wrote) plus a tail
+// hold-down. Refreshes the half-duplex mute deadline on every poll
+// so the capture gate stays closed for the entire audible playback,
+// not just the synthesis wall-clock.
+func (s *Session) waitPlaybackDrain(ctx context.Context, tail time.Duration) {
+	if s.pb == nil {
+		return
+	}
+	sr := s.pb.SampleRate()
+	if sr <= 0 {
+		return
+	}
+	const poll = 50 * time.Millisecond
+	for {
+		ringSamples := s.pb.Ring().Len()
+		drainMs := int64(ringSamples) * 1000 / int64(sr)
+		deadline := time.Now().Add(time.Duration(drainMs)*time.Millisecond + tail)
+		// Keep the mute deadline aligned with the worst-case
+		// drain estimate; the consumer side only consults the
+		// stored value.
+		if deadline.UnixNano() > s.muteUntilNs.Load() {
+			s.muteUntilNs.Store(deadline.UnixNano())
+		}
+		if ringSamples == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(poll):
 		}
 	}
 }
