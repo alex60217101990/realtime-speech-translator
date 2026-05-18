@@ -58,7 +58,7 @@ func main() {
 	// the chrome / idle sphere.
 	go bringUpSession(ctx, app, cfg)
 
-	if err := uiebt.Run(); err != nil {
+	if err := uiebt.RunApp(app); err != nil {
 		slog.Error("ui exited with error", "err", err)
 		os.Exit(1)
 	}

@@ -103,22 +103,21 @@ func (a *App) SetStatus(s SessionStatus) {
 // AppendTranscript pushes one finalised STT line to the left pane.
 func (a *App) AppendTranscript(text, ts string) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.transcript = append(a.transcript, Card{Text: text, Timestamp: ts, Active: true})
-	// dim the previous active card.
 	if n := len(a.transcript); n >= 2 {
 		a.transcript[n-2].Active = false
 	}
-	a.mu.Unlock()
 }
 
 // AppendTranslation pushes one MT line to the right pane.
 func (a *App) AppendTranslation(text, ts string) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.translation = append(a.translation, Card{Text: text, Timestamp: ts, Active: true})
 	if n := len(a.translation); n >= 2 {
 		a.translation[n-2].Active = false
 	}
-	a.mu.Unlock()
 }
 
 // SetLanguages updates the pane headers + flag colours.
@@ -227,14 +226,28 @@ func (a *App) Layout(outerWidth, outerHeight int) (int, int) {
 	return outerWidth, outerHeight
 }
 
-// Run sets up the window and enters the Ebiten event loop.
+// Run sets up the window and runs the Ebiten event loop on a
+// freshly-constructed App. Convenience entry-point for tools that
+// do not need to bind external state to the UI (e.g. design demos).
+//
+// Production binaries should call RunApp instead — they hold the
+// same *App reference both their binding goroutine pushes events
+// to and the Ebiten loop renders from. Calling Run() in that
+// scenario was the bug that made transcripts vanish into an
+// orphan App while the rendered App stayed empty.
 func Run() error {
+	return RunApp(NewApp())
+}
+
+// RunApp opens the window and enters the Ebiten event loop with
+// the supplied App. Blocks until the user closes the window.
+func RunApp(app *App) error {
 	ebiten.SetWindowTitle("Realtime Speech Translator")
 	ebiten.SetWindowSize(WindowWidth, WindowHeight)
 	ebiten.SetWindowResizable(true)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetTPS(60)
-	return ebiten.RunGame(NewApp())
+	return ebiten.RunGame(app)
 }
 
 // ensureBackground rebuilds the cached gradient image when the
