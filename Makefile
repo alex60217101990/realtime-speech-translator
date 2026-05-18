@@ -4,73 +4,76 @@ BIN          := $(BIN_DIR)/$(PROJECT)
 PKG          := ./...
 
 GO           ?= go
-GOEXPERIMENT ?= simd
 CGO_ENABLED  ?= 1
 GOFLAGS      ?= -trimpath
+VERSION      ?= dev
 
-LDFLAGS      := -s -w
+# -ldflags injects the version string into cmd/translator/main.go and
+# strips DWARF / symbol tables for a tighter binary.
+LDFLAGS      := -s -w -X main.version=$(VERSION)
 
 UNAME_S      := $(shell uname -s)
 
-# --- whisper.cpp env wiring -------------------------------------------------
-# The ggml-metal subdir is included in LIBRARY_PATH on Darwin regardless
-# of whether Metal was actually compiled — build-deps.sh drops an empty
-# libggml-metal.a stub there so the upstream cgo binding (which hardcodes
-# `-lggml-metal`) still links. Apple Silicon users who opt into Metal
-# with GGML_METAL=ON get a real lib in the same place.
-WHISPER_DIR  := $(abspath third_party/whisper.cpp)
-WHISPER_BUILD:= $(WHISPER_DIR)/build_go
-WHISPER_INC  := $(WHISPER_DIR)/include:$(WHISPER_DIR)/ggml/include
-WHISPER_LIB  := $(WHISPER_BUILD)/src:$(WHISPER_BUILD)/ggml/src
-ifeq ($(UNAME_S),Darwin)
-WHISPER_LIB  := $(WHISPER_LIB):$(WHISPER_BUILD)/ggml/src/ggml-blas:$(WHISPER_BUILD)/ggml/src/ggml-metal
-# GGML_METAL_PATH_RESOURCES points the ggml-metal runtime at the
-# Metal source tree so it can compile shaders on the fly. Harmless
-# when Metal is off (no caller looks at the env), useful when the
-# user opts back in with GGML_METAL=ON.
-export GGML_METAL_PATH_RESOURCES := $(WHISPER_DIR)
-endif
-
-# --- sentencepiece env wiring -----------------------------------------------
+# ----------------------------------------------------------------------------
+# Optional MT cgo wiring
+# ----------------------------------------------------------------------------
+# internal/mt is gated by the `mt` build tag because SentencePiece and
+# CTranslate2 must be compiled out of third_party/ first. The default
+# target builds without translation (mt.Disabled passthrough); the
+# `mt` target wires in the cgo paths and adds -tags mt.
 SP_DIR    := $(abspath third_party/sentencepiece)
 SP_BUILD  := $(SP_DIR)/build_go
 SP_INC    := $(SP_DIR)/src:$(SP_BUILD)/src
 SP_LIB    := $(SP_BUILD)/src
 
-# --- ctranslate2 env wiring -------------------------------------------------
 CT2_DIR   := $(abspath third_party/ctranslate2)
 CT2_BUILD := $(CT2_DIR)/build_go
 CT2_INC   := $(CT2_DIR)/include
-# CT2 is itself a single static lib; ruy, cpu_features and ruy's
-# bundled cpuinfo / clog are nested.
 CT2_LIB   := $(CT2_BUILD):$(CT2_BUILD)/third_party/cpu_features:$(CT2_BUILD)/third_party/ruy/ruy:$(CT2_BUILD)/third_party/ruy/third_party/cpuinfo:$(CT2_BUILD)/third_party/ruy/third_party/cpuinfo/deps/clog
 
 export CGO_ENABLED
-export GOEXPERIMENT
-# CPATH covers both C and C++ search paths (whereas C_INCLUDE_PATH is
-# C-only). Cgo shims for SentencePiece and CTranslate2 are C++, so we
-# need CPATH so #include resolves under the cgo build.
-export CPATH          := $(WHISPER_INC):$(SP_INC):$(CT2_INC):$(CPATH)
-export C_INCLUDE_PATH := $(WHISPER_INC):$(SP_INC):$(CT2_INC):$(C_INCLUDE_PATH)
-export LIBRARY_PATH   := $(WHISPER_LIB):$(SP_LIB):$(CT2_LIB):$(LIBRARY_PATH)
 
-# CTranslate2 vendored headers (half_float, nlohmann/json) trigger
-# deprecation warnings under modern clang; silence to keep build output
-# readable.
+# CGO_CXXFLAGS suppresses CT2 vendored header noise under modern clang.
 export CGO_CXXFLAGS := -Wno-deprecated-literal-operator $(CGO_CXXFLAGS)
 
-.PHONY: all build run test test-race vet lint bench tidy clean deps deps-whisper
+.PHONY: all build mt run test test-race vet lint bench tidy clean
+.PHONY: deps deps-sentencepiece deps-ctranslate2
+.PHONY: package package-macos package-linux package-windows
 
 all: build
 
 $(BIN_DIR):
 	@mkdir -p $@
 
-# --- native deps ------------------------------------------------------------
-deps: deps-whisper deps-sentencepiece deps-ctranslate2
+# ----------------------------------------------------------------------------
+# Builds
+# ----------------------------------------------------------------------------
 
-deps-whisper:
-	./scripts/build-deps.sh whisper
+# Default: STT + TTS only (MT runs in Disabled passthrough). No
+# third_party compilation required — sherpa-onnx native libs come
+# from the per-platform Go module dependency.
+build: | $(BIN_DIR)
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/translator
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/probe   ./cmd/probe
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/stt-mic ./cmd/stt-mic
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/tts-say ./cmd/tts-say
+
+# `make mt` builds the translator with SMaLL-100 / OPUS-MT enabled.
+# Requires the sentencepiece + ctranslate2 submodules to be initialised
+# (git submodule update --init) and compiled (make deps).
+mt: | $(BIN_DIR)
+	CPATH="$(SP_INC):$(CT2_INC):$$CPATH" \
+	C_INCLUDE_PATH="$(SP_INC):$(CT2_INC):$$C_INCLUDE_PATH" \
+	LIBRARY_PATH="$(SP_LIB):$(CT2_LIB):$$LIBRARY_PATH" \
+	$(GO) build $(GOFLAGS) -tags mt -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/translator
+
+run: build
+	./$(BIN)
+
+# ----------------------------------------------------------------------------
+# Native dependency builds (only needed for `make mt`)
+# ----------------------------------------------------------------------------
+deps: deps-sentencepiece deps-ctranslate2
 
 deps-sentencepiece:
 	./scripts/build-deps.sh sentencepiece
@@ -78,14 +81,9 @@ deps-sentencepiece:
 deps-ctranslate2:
 	./scripts/build-deps.sh ctranslate2
 
-# --- Go ---------------------------------------------------------------------
-build: | $(BIN_DIR)
-	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/translator
-	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/bench ./cmd/bench
-
-run: build
-	./$(BIN)
-
+# ----------------------------------------------------------------------------
+# Test, vet, bench
+# ----------------------------------------------------------------------------
 test:
 	$(GO) test $(PKG)
 
@@ -95,10 +93,6 @@ test-race:
 vet:
 	$(GO) vet $(PKG)
 
-# go fix needs the same cgo env (CPATH, LIBRARY_PATH, …) as build, since
-# fix walks the AST per package and bails on cgo packages whose headers
-# it can't resolve. Run it via this target rather than `go fix` in a
-# bare shell.
 fix:
 	$(GO) fix $(PKG)
 
@@ -111,13 +105,9 @@ tidy:
 clean:
 	rm -rf $(BIN_DIR) dist
 
-# --- packaging ---------------------------------------------------------------
-# Per-OS installer / bundle builds. VERSION is propagated into binary
-# build (-X main.version) and into the Info.plist / NSIS metadata.
-VERSION ?= 0.0.0
-
-.PHONY: package package-macos package-linux package-windows
-
+# ----------------------------------------------------------------------------
+# Packaging
+# ----------------------------------------------------------------------------
 package:
 	@case "$(UNAME_S)" in \
 		Darwin)  $(MAKE) package-macos ;; \
