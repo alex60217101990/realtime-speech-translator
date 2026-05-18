@@ -5,6 +5,7 @@ go 1.26
 require (
 	fyne.io/fyne/v2 v2.7.4
 	github.com/gen2brain/malgo v0.11.25
+	github.com/k2-fsa/sherpa-onnx-go v1.13.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -19,6 +20,9 @@ require (
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade // indirect
+	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.2 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.2 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.17 // indirect
 	github.com/nicksnyder/go-i18n/v2 v2.5.1 // indirect
