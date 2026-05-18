@@ -107,6 +107,21 @@ type Config struct {
 	// dropped when the recognizer can't keep up. Each frame is one
 	// Push call from the audio source — typically 10–100 ms.
 	AudioBufferFrames int
+
+	// DecodingMethod selects the sherpa decoder. "greedy_search"
+	// is fastest but lower quality; "modified_beam_search" is the
+	// recommended quality setting and only adds a few ms per chunk.
+	DecodingMethod string
+
+	// MaxActivePaths is the beam width when DecodingMethod is
+	// modified_beam_search. 4 is the upstream default.
+	MaxActivePaths int
+
+	// EnablePreEmphasis turns on a 100 Hz single-pole IIR high-pass
+	// before AcceptWaveform. Strips AC hum / mic-stand rumble that
+	// adds nothing to the log-mel spectrogram and visibly improves
+	// CTC accuracy on cheap built-in laptop microphones.
+	EnablePreEmphasis bool
 }
 
 // DefaultConfig returns recommended defaults for realtime mic capture.
@@ -126,6 +141,9 @@ func DefaultConfig() Config {
 		VADWindowSize:              512,
 		VADBufferSeconds:           60,
 		AudioBufferFrames:          64,
+		DecodingMethod:             "modified_beam_search",
+		MaxActivePaths:             4,
+		EnablePreEmphasis:          true,
 	}
 }
 
@@ -191,7 +209,30 @@ type Engine struct {
 	vadActiveNs atomic.Uint64 // ns inside VAD speech, monotonic
 	totalNs     atomic.Uint64 // ns of audio processed, monotonic
 
+	// pre-emphasis state (single-pole high-pass IIR, stateful
+	// across chunks). Only touched from the Run goroutine.
+	hpPrevX float32
+	hpPrevY float32
+
 	closeOnce sync.Once
+}
+
+// highPass100Hz applies a 100 Hz single-pole IIR HPF in place,
+// carrying state across chunks. α = exp(-2π · fc / fs); for the
+// default 16 kHz capture this is ≈ 0.9610.
+func (e *Engine) highPass100Hz(samples []float32) {
+	if len(samples) == 0 {
+		return
+	}
+	const alpha = float32(0.9610)
+	prevX, prevY := e.hpPrevX, e.hpPrevY
+	for i, x := range samples {
+		y := alpha * (prevY + x - prevX)
+		samples[i] = y
+		prevX = x
+		prevY = y
+	}
+	e.hpPrevX, e.hpPrevY = prevX, prevY
 }
 
 // Utterances returns the count of finalised utterances since Run.
@@ -266,10 +307,19 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
+	decoding := cfg.DecodingMethod
+	if decoding == "" {
+		decoding = "greedy_search"
+	}
+	maxPaths := cfg.MaxActivePaths
+	if maxPaths <= 0 {
+		maxPaths = 4
+	}
 	recCfg := sherpa.OnlineRecognizerConfig{
 		FeatConfig:              sherpa.FeatureConfig{SampleRate: cfg.SampleRate, FeatureDim: 80},
 		ModelConfig:             modelCfg,
-		DecodingMethod:          "greedy_search",
+		DecodingMethod:          decoding,
+		MaxActivePaths:          maxPaths,
 		EnableEndpoint:          1,
 		Rule1MinTrailingSilence: cfg.Rule1MinTrailingSilenceSec,
 		Rule2MinTrailingSilence: cfg.Rule2MinTrailingSilenceSec,
@@ -383,6 +433,9 @@ func (e *Engine) Run(ctx context.Context) {
 				continue
 			}
 
+			if e.cfg.EnablePreEmphasis {
+				e.highPass100Hz(samples)
+			}
 			stream.AcceptWaveform(e.cfg.SampleRate, samples)
 			inSegment = true
 
