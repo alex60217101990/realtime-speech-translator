@@ -1,10 +1,12 @@
 package uiebt
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
@@ -62,6 +64,11 @@ type App struct {
 	sourceCode  string // "ru"
 	targetCode  string // "en"
 	hint        string // bottom-bar microcopy
+
+	// quit is flipped by RequestQuit (Ctrl+C / signal). The Update
+	// loop checks it on every tick and returns ebiten.Termination,
+	// which is how Ebiten exits cleanly.
+	quit atomic.Bool
 }
 
 // backgroundCache holds the per-size gradient image so we only
@@ -135,7 +142,13 @@ func (a *App) SetLanguages(srcCode, srcLabel, tgtCode, tgtLabel string) {
 // the sphere visibly breathe on the splash / waiting-for-models
 // screen. Real audio buckets from cmd/translator-ui will overwrite
 // the idle values whenever they arrive.
+//
+// Returns ebiten.Termination when RequestQuit has been called so the
+// Ebiten loop exits cleanly on Ctrl+C.
 func (a *App) Update() error {
+	if a.quit.Load() {
+		return ebiten.Termination
+	}
 	const dt = 1.0 / 60.0
 	a.sphere.Tick(dt)
 	if !a.sphereHasAudio() {
@@ -143,6 +156,12 @@ func (a *App) Update() error {
 		a.sphere.setAudioInternal(idleAudio(t))
 	}
 	return nil
+}
+
+// RequestQuit signals the Update loop to exit the Ebiten game on
+// its next tick. Safe to call from any goroutine.
+func (a *App) RequestQuit() {
+	a.quit.Store(true)
 }
 
 // idleAudio synthesises a calm breathing wave so the sphere is
@@ -236,18 +255,29 @@ func (a *App) Layout(outerWidth, outerHeight int) (int, int) {
 // scenario was the bug that made transcripts vanish into an
 // orphan App while the rendered App stayed empty.
 func Run() error {
-	return RunApp(NewApp())
+	return RunApp(context.Background(), NewApp())
 }
 
 // RunApp opens the window and enters the Ebiten event loop with
-// the supplied App. Blocks until the user closes the window.
-func RunApp(app *App) error {
+// the supplied App. Blocks until the user closes the window OR
+// ctx is cancelled — a cancellation flips the App's quit flag and
+// the Update loop returns ebiten.Termination on its next tick.
+func RunApp(ctx context.Context, app *App) error {
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			app.RequestQuit()
+		}()
+	}
 	ebiten.SetWindowTitle("Realtime Speech Translator")
 	ebiten.SetWindowSize(WindowWidth, WindowHeight)
 	ebiten.SetWindowResizable(true)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetTPS(60)
-	return ebiten.RunGame(app)
+	if err := ebiten.RunGame(app); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ensureBackground rebuilds the cached gradient image when the

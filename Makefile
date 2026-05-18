@@ -36,7 +36,7 @@ export CGO_ENABLED
 # CGO_CXXFLAGS suppresses CT2 vendored header noise under modern clang.
 export CGO_CXXFLAGS := -Wno-deprecated-literal-operator $(CGO_CXXFLAGS)
 
-.PHONY: all build mt run test test-race vet lint bench tidy clean
+.PHONY: all build mt ui mt-ui run test test-race vet lint bench tidy clean
 .PHONY: deps deps-sentencepiece deps-ctranslate2
 .PHONY: package package-macos package-linux package-windows
 
@@ -66,6 +66,18 @@ mt: | $(BIN_DIR)
 	C_INCLUDE_PATH="$(SP_INC):$(CT2_INC):$$C_INCLUDE_PATH" \
 	LIBRARY_PATH="$(SP_LIB):$(CT2_LIB):$$LIBRARY_PATH" \
 	$(GO) build $(GOFLAGS) -tags mt -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/translator
+
+# `make ui` builds the Ebiten translator-ui without MT (passthrough).
+ui: | $(BIN_DIR)
+	$(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/translator-ui ./cmd/translator-ui
+
+# `make mt-ui` builds the Ebiten translator-ui with SMaLL-100 / OPUS-MT
+# wired in. Same prerequisites as `make mt`.
+mt-ui: | $(BIN_DIR)
+	CPATH="$(SP_INC):$(CT2_INC):$$CPATH" \
+	C_INCLUDE_PATH="$(SP_INC):$(CT2_INC):$$C_INCLUDE_PATH" \
+	LIBRARY_PATH="$(SP_LIB):$(CT2_LIB):$$LIBRARY_PATH" \
+	$(GO) build $(GOFLAGS) -tags mt -ldflags='$(LDFLAGS)' -o $(BIN_DIR)/translator-ui ./cmd/translator-ui
 
 run: build
 	./$(BIN)

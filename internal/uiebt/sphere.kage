@@ -67,40 +67,100 @@ func fbm(p vec2) float {
 
 // --- particle layers ------------------------------------------------------
 
-// Particles — dense grid of small dots. Bass + audio modulate a
-// flow-field displacement so the swarm visibly contracts toward
-// hot spots and re-disperses when the beat decays.
+// Particles — fish-school swarm via Worley-style 3x3 search.
 //
-// density   cells per radius (sets grain size; 64 = thousands of
-//           particles across the body).
-// pick      hash threshold; 0.4 → ~60% of cells host a particle.
-// twinkle   per-particle phase from hash, so the swarm never feels
-//           synchronized.
-func particles(uv vec2, t float, bass float, mid float) float {
-	// Slow flow field for converge / disperse.
-	flow := vec2(
-		fbm(uv*0.7+vec2(t*0.10, 0.0)),
-		fbm(uv*0.7+vec2(0.0, t*0.10)),
-	) - 0.5
-
-	// Bass collapses particles inward toward field nodes; mid
-	// rotates the displacement slightly so the contraction is
-	// not radial.
-	displace := flow * (0.02 + 0.10*bass)
-	rot := mat2(cos(mid), -sin(mid), sin(mid), cos(mid))
-	uv = uv - rot*displace
-
-	g := uv * 64.0
+// Behaviour model:
+//   schoolDir   slow random global flow vector; every particle pulls
+//               toward it (cohesion) so the swarm moves as a body.
+//   wiggle      per-particle orbit around its home cell so the body
+//               looks alive even at zero audio.
+//   scatter     when rms / bass spike, particles burst outward along
+//               a per-cell direction; the Go EMA smooths rms over
+//               ~80ms so the burst then decays and the school
+//               re-forms naturally.
+//
+// The 3x3 scan keeps the swarm continuous — a particle pushed out
+// of its home cell still gets rendered by neighbour cells, so it
+// visibly migrates instead of disappearing at the cell boundary.
+func particles(uv vec2, t float, bass float, mid float, treble float, rms float) float {
+	g := uv * 36.0
 	cell := floor(g)
-	jitter := vec2(hash(cell), hash(cell+vec2(7.3, 1.7)))
-	pos := cell + jitter
-	d := distance(g, pos)
+	fp := g - cell
 
-	pick := step(0.40, hash(cell+vec2(3.1, 5.7)))
-	bright := 0.25 + 0.75*hash(cell+vec2(11.1, 13.3))
-	tw := 0.55 + 0.45*sin(t*(2.0+hash(cell)*4.0)+hash(cell)*60.0)
+	// Global school direction — slow wander from sum of low-freq sines
+	// so the school heading drifts over seconds, not frames.
+	schoolDir := vec2(
+		sin(t*0.31)+0.5*sin(t*0.71+1.3),
+		cos(t*0.27+0.7)+0.5*cos(t*0.59+2.1),
+	) * 0.42
 
-	return smoothstep(0.18, 0.0, d) * pick * bright * tw
+	// Periodic school "turn" — every few seconds the school makes a
+	// sharp manoeuvre, like a flock dodging. pow(sin, 8) gives long
+	// quiet periods then a brief sharp event.
+	turnAmp := pow(max(0.0, sin(t*0.45+1.3)), 8.0)
+	schoolDir += vec2(cos(t*0.8), sin(t*0.8)) * turnAmp * 0.35
+
+	// Spontaneous burst event — gives a visible scatter even when
+	// the audio is silent. Different phase so it doesn't sync with
+	// turns.
+	burst := pow(max(0.0, sin(t*0.55+2.7)), 12.0)
+
+	minD := 99.0
+	minBright := 0.0
+
+	for j := -1; j <= 1; j++ {
+		for i := -1; i <= 1; i++ {
+			nb := cell + vec2(float(i), float(j))
+			h1 := hash(nb)
+			h2 := hash(nb + vec2(7.3, 1.7))
+			h3 := hash(nb + vec2(3.1, 5.7))
+			h4 := hash(nb + vec2(11.1, 13.3))
+			h5 := hash(nb + vec2(0.7, 19.3))
+			h6 := hash(nb + vec2(23.1, 4.9))
+
+			sens := 0.40 + 0.60*h6
+
+			// Wiggle — fast small orbit around home, amplitude itself
+			// breathes so the swarm looks more chaotic than mechanical.
+			wigPhase := t*(1.1+h1*1.8) + h2*40.0
+			wigAmp := 0.20 + 0.10*sin(t*0.4+h1*5.0)
+			wiggle := vec2(cos(wigPhase), sin(wigPhase)) * wigAmp
+
+			// Cohesion — pulls particle toward the global flow heading.
+			cohesion := schoolDir * (0.50 + 0.25*h5)
+
+			// Mid rotates the cohesion slightly per-particle so the
+			// school isn't a single rigid block.
+			rotA := mid*1.2 + h1*0.6
+			c := cos(rotA)
+			s := sin(rotA)
+			cohesion = mat2(c, -s, s, c) * cohesion
+
+			// Scatter — radial burst along per-cell direction. Driven
+			// by audio AND the spontaneous burst event so the school
+			// scatters periodically even in silence.
+			scatAng := h5 * 6.2832
+			scatDir := vec2(cos(scatAng), sin(scatAng))
+			scatter := scatDir * (rms*1.6*sens + bass*0.9*sens + burst*0.55*sens) * 0.65
+
+			home := vec2(h1, h2)
+			off := home + wiggle + cohesion + scatter
+
+			diff := vec2(float(i), float(j)) + off - fp
+			d := length(diff)
+
+			if d < minD {
+				minD = d
+				pick := step(0.30, h3)
+				bright := 0.30 + 0.70*h4
+				tw := 0.60 + 0.40*sin(t*(2.0+h1*4.0)+h1*60.0)
+				minBright = pick * bright * tw
+			}
+		}
+	}
+
+	r := 0.17 + 0.05*rms + 0.025*treble
+	return smoothstep(r, 0.0, minD) * minBright
 }
 
 // Accent stars — sparser, brighter layer on top of the particles
@@ -116,26 +176,49 @@ func accentStars(uv vec2, t float) float {
 	return smoothstep(0.12, 0.0, d) * pick * tw
 }
 
-// --- energy field outside ------------------------------------------------
+// --- waveform field outside ----------------------------------------------
 
-// Concentric ripple rings + angular streaks, faded with distance.
-// Visible only outside the sphere (rn > 1).
-func forceField(rn float, ang float, t float, audio float) float {
+// --- waveform field outside ----------------------------------------------
+
+// waveform draws a smooth sinusoidal closed loop around the sphere.
+// The loop's radius at each angle is the sum of three harmonics —
+// low (bass), mid (mid), high (treble) — so loud voice produces
+// taller peaks and silence flattens it back to a still ring.
+//
+// Smooth (not EKG-style) so the trace reads as flowing energy.
+func waveform(rn float, ang float, t float, bass float, mid float, treble float, rms float) float {
 	if rn < 1.0 {
 		return 0.0
 	}
-	// 5 ring set inside the halo band [1.0, 1.4]; they shrink
-	// inward over time (negative phase) so the "shield" looks
-	// like it's being struck and ripples toward the body.
-	band := smoothstep(1.45, 1.02, rn)
-	rings := sin((rn-1.0)*38.0-t*3.5) * 0.5 + 0.5
-	rings = pow(rings, 2.0)
+	// Three angular harmonics at different frequencies. Each scrolls
+	// at its own rate so the trace never settles into a static shape.
+	w1 := sin(ang*3.0+t*0.55) * (0.04 + 0.32*bass)
+	w2 := sin(ang*7.0-t*0.85) * (0.03 + 0.22*mid)
+	w3 := sin(ang*15.0+t*1.30) * (0.02 + 0.18*treble)
 
-	// Angular streaks running around the surface — modest count
-	// so they read as direction lines, not stripes.
-	streaks := pow(sin(ang*7.0+t*1.2)*0.5+0.5, 4.0)
+	// Soft floor so the ring is always visible.
+	base := 0.02 + 0.02*sin(ang*5.0+t*0.7)
 
-	return band * rings * (0.45 + 0.55*audio + 0.30*streaks)
+	peak := w1 + w2 + w3 + base
+	wavR := 1.16 + peak
+
+	line := smoothstep(0.045, 0.0, abs(rn-wavR))
+	fade := smoothstep(1.55, 1.05, rn)
+	return line * fade
+}
+
+// ghostWave is a second, fainter inner trace closer to the body.
+// Two smooth traces give the "energy halo" feel.
+func ghostWave(rn float, ang float, t float, bass float, mid float) float {
+	if rn < 1.0 {
+		return 0.0
+	}
+	w := sin(ang*5.0-t*0.9) * (0.025 + 0.18*bass)
+	w += sin(ang*11.0+t*1.5) * (0.015 + 0.12*mid)
+	wavR := 1.08 + w
+	line := smoothstep(0.035, 0.0, abs(rn-wavR))
+	fade := smoothstep(1.35, 1.02, rn)
+	return line * fade
 }
 
 // --- main fragment -------------------------------------------------------
@@ -181,11 +264,12 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 
 	// Particle dust — masked to the inside, brighter near the
 	// equator (1 - rn drop-off keeps the silhouette dark so we
-	// can see the rim).
+	// can see the rim). Reactive layer: bass/mid/treble/rms all
+	// feed in so the swarm scatters on loud frames.
 	innerFalloff := smoothstep(1.0, 0.5, rn)
-	dust := particles(uv, Time, Bass, Mid) * innerFalloff
+	dust := particles(uv, Time, Bass, Mid, Treble, Rms) * innerFalloff
 	dustCol := mix(vec3(0.55, 0.70, 1.00), vec3(0.90, 0.50, 1.00), cluster)
-	dust *= 1.4 + 0.6*Bass
+	dust *= 1.4 + 0.9*Bass + 0.5*Rms
 
 	// Accent stars — a few bright key points.
 	acc := accentStars(uv, Time) * innerFalloff
@@ -195,9 +279,12 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 	rim := pow(clamp(rn, 0.0, 1.0), 24.0) * core
 	rimCol := vec3(0.65, 0.85, 1.00) * (0.9 + 1.6*Treble)
 
-	// Force-field ripples outside the body.
-	field := forceField(rn, ang, Time, 0.30+0.7*Rms)
-	fieldCol := vec3(0.40, 0.75, 1.00) * (0.4 + 1.2*Treble)
+	// Smooth waveform halo outside the body — two flowing sinusoidal
+	// traces that pulse with the audio. Outer is full-spectrum, inner
+	// (ghost) is the calmer companion line.
+	wave := waveform(rn, ang, Time, Bass, Mid, Treble, Rms)
+	ghost := ghostWave(rn, ang, Time, Bass, Mid) * 0.7
+	waveCol := vec3(0.45, 0.80, 1.00) * (0.7 + 1.4*Treble + 0.6*Rms)
 
 	// Compose.
 	col := vec3(0.0)
@@ -205,9 +292,9 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 	col += dustCol * dust * core
 	col += accCol * acc * core
 	col += rimCol * rim
-	col += fieldCol * field
+	col += waveCol * (wave + ghost)
 	col += mix(colA, colB, 0.5) * halo * 0.30 * (0.5 + 0.5*Rms)
 
-	alpha := clamp(core+halo*0.5+rim+field*0.6, 0.0, 1.0)
+	alpha := clamp(core+halo*0.5+rim+(wave+ghost)*0.85, 0.0, 1.0)
 	return vec4(col*alpha, alpha)
 }

@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"image"
 	"log/slog"
+	"math"
 	"sync"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -31,10 +32,16 @@ type Sphere struct {
 	shader *ebiten.Shader
 
 	mu             sync.RWMutex
-	a              SphereAudio
+	target         SphereAudio // latest snapshot pushed by SetAudio
+	a              SphereAudio // EMA-smoothed value handed to shader
 	time           float64
 	externalDriven bool // flipped true by the first SetAudio call
 }
+
+// audioSmoothTau is the time constant of the per-frame EMA that
+// hides jitter from the bucket pump and stretches each transient so
+// the visual reads as motion instead of strobing.
+const audioSmoothTau = 0.08
 
 // NewSphere compiles the Kage shader. Panics on compile failure —
 // the shader is a static asset and a parse error means the binary
@@ -48,21 +55,28 @@ func NewSphere() *Sphere {
 	return &Sphere{shader: sh}
 }
 
-// Tick advances the shader's Time uniform by dt seconds. Called
-// from App.Update once per frame.
+// Tick advances the shader's Time uniform by dt seconds and runs an
+// exponential moving average from target → a so the per-bucket jumps
+// stretch into smooth animation. Called from App.Update once per
+// frame.
 func (s *Sphere) Tick(dt float64) {
 	s.mu.Lock()
 	s.time += dt
+	alpha := float32(1.0 - math.Exp(-dt/audioSmoothTau))
+	s.a.Bass += (s.target.Bass - s.a.Bass) * alpha
+	s.a.Mid += (s.target.Mid - s.a.Mid) * alpha
+	s.a.Treble += (s.target.Treble - s.a.Treble) * alpha
+	s.a.Rms += (s.target.Rms - s.a.Rms) * alpha
 	s.mu.Unlock()
 }
 
-// SetAudio updates the bass / mid / treble / rms uniforms. Safe
-// for concurrent calls from the audio-bucket goroutine. The first
-// non-idle call flips externalDriven; from then on the App's idle
-// wave stops overwriting these values.
+// SetAudio updates the bass / mid / treble / rms target. Safe for
+// concurrent calls from the audio-bucket goroutine. Tick interpolates
+// the live uniform toward target each frame, so this can be called
+// at any cadence without strobing the shader.
 func (s *Sphere) SetAudio(a SphereAudio) {
 	s.mu.Lock()
-	s.a = a
+	s.target = a
 	if a.Bass != 0 || a.Mid != 0 || a.Treble != 0 || a.Rms != 0 {
 		s.externalDriven = true
 	}
@@ -73,7 +87,7 @@ func (s *Sphere) SetAudio(a SphereAudio) {
 // flip externalDriven, so a real SetAudio later still takes over.
 func (s *Sphere) setAudioInternal(a SphereAudio) {
 	s.mu.Lock()
-	s.a = a
+	s.target = a
 	s.mu.Unlock()
 }
 
