@@ -44,6 +44,7 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts"
+	"github.com/alex60217101990/realtime-speech-translator/internal/tts/native"
 	"github.com/alex60217101990/realtime-speech-translator/internal/ui"
 )
 
@@ -86,10 +87,13 @@ func main() {
 		cfg.TTSEnabled = false
 	}
 
-	session, err := buildSession(cfg)
+	session, nativeTTS, err := buildSession(cfg)
 	if err != nil {
 		slog.Error("build session", "err", err)
 		os.Exit(1)
+	}
+	if nativeTTS != nil {
+		slog.Info("piper unavailable; using native TTS fallback", "backend", nativeTTS.Backend())
 	}
 
 	a := app.NewWithID("io.github.alex60217101990.rstranslator")
@@ -121,7 +125,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	go pumpEvents(ctx, session, liveCtl)
+	go pumpEvents(ctx, session, liveCtl, nativeTTS)
 
 	w.SetOnClosed(func() {
 		cancel()
@@ -134,14 +138,21 @@ func main() {
 // buildSession resolves all model paths from the settings + paths
 // helpers, constructs the MT engine, and returns a ready-but-not-yet-
 // started rstapp.Session.
-func buildSession(cfg config.Settings) (*rstapp.Session, error) {
+//
+// When TTSEnabled is true but the Piper voice files are missing or
+// fail to load, the session is constructed with TTS off and a
+// nativeTTS engine (say / espeak / powershell) is returned for the
+// cmd layer to invoke directly from the event pump. Returns
+// nativeTTS == nil when sherpa Piper loaded successfully or when
+// the host has no usable native synthesizer either.
+func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) {
 	sttDir, err := paths.STTDir(cfg.STTModel)
 	if err != nil {
-		return nil, fmt.Errorf("stt dir: %w", err)
+		return nil, nil, fmt.Errorf("stt dir: %w", err)
 	}
 	vadPath, err := paths.VADModel()
 	if err != nil {
-		return nil, fmt.Errorf("vad path: %w", err)
+		return nil, nil, fmt.Errorf("vad path: %w", err)
 	}
 	sttCfg := stt.DefaultConfig()
 	sttCfg.Encoder = filepath.Join(sttDir, "encoder.onnx")
@@ -153,16 +164,26 @@ func buildSession(cfg config.Settings) (*rstapp.Session, error) {
 	sttCfg.VADThreshold = cfg.VADThreshold
 
 	var ttsCfg tts.Config
-	if cfg.TTSEnabled {
+	ttsEnabled := cfg.TTSEnabled
+	var nativeFallback *native.Engine
+	if ttsEnabled {
 		ttsDir, err := paths.TTSDir(cfg.TTSVoice)
-		if err != nil {
-			return nil, fmt.Errorf("tts dir: %w", err)
+		if err == nil && piperVoiceComplete(ttsDir) {
+			ttsCfg = tts.DefaultConfig()
+			ttsCfg.Model = filepath.Join(ttsDir, "model.onnx")
+			ttsCfg.Tokens = filepath.Join(ttsDir, "tokens.txt")
+			ttsCfg.DataDir = filepath.Join(ttsDir, "espeak-ng-data")
+			ttsCfg.NumThreads = cfg.Threads
+		} else {
+			slog.Warn("piper voice not installed; attempting native TTS",
+				"voice", cfg.TTSVoice, "err", err)
+			ttsEnabled = false
+			if n, err := native.New(); err == nil {
+				nativeFallback = n
+			} else {
+				slog.Warn("no native TTS either; translations will be text-only", "err", err)
+			}
 		}
-		ttsCfg = tts.DefaultConfig()
-		ttsCfg.Model = filepath.Join(ttsDir, "model.onnx")
-		ttsCfg.Tokens = filepath.Join(ttsDir, "tokens.txt")
-		ttsCfg.DataDir = filepath.Join(ttsDir, "espeak-ng-data")
-		ttsCfg.NumThreads = cfg.Threads
 	}
 
 	mtEngine, err := buildMT(cfg)
@@ -171,15 +192,30 @@ func buildSession(cfg config.Settings) (*rstapp.Session, error) {
 		mtEngine = mt.Disabled{}
 	}
 
-	return rstapp.New(rstapp.Config{
+	sess, err := rstapp.New(rstapp.Config{
 		Source:     cfg.SourceLang,
 		Target:     cfg.TargetLang,
 		STT:        sttCfg,
 		TTS:        ttsCfg,
 		MT:         mtEngine,
-		TTSEnabled: cfg.TTSEnabled,
+		TTSEnabled: ttsEnabled,
 		Logger:     slog.Default(),
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return sess, nativeFallback, nil
+}
+
+// piperVoiceComplete returns true when the directory contains the
+// three files required by the sherpa Piper engine.
+func piperVoiceComplete(dir string) bool {
+	for _, leaf := range []string{"model.onnx", "tokens.txt", "espeak-ng-data"} {
+		if _, err := os.Stat(filepath.Join(dir, leaf)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func buildMT(cfg config.Settings) (mt.Engine, error) {
@@ -257,7 +293,11 @@ func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
 // pumpEvents drains the Session event channel onto the UI controls.
 // All widget mutations cross into the Fyne goroutine via go fyne.Do —
 // safe under Fyne v2's threading model.
-func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls) {
+//
+// When nativeTTS is non-nil the session itself runs with TTS off and
+// every Translation event is forwarded to the native synthesizer in
+// a fire-and-forget goroutine.
+func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativeTTS *native.Engine) {
 	statusTick := time.NewTicker(750 * time.Millisecond)
 	defer statusTick.Stop()
 
@@ -292,6 +332,13 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls) {
 					ctl.translation.SetText(tgt)
 					appendHistory(ctl, "→ "+tgt)
 				})
+				if nativeTTS != nil && tgt != "" {
+					go func(text string) {
+						if err := nativeTTS.Speak(ctx, text); err != nil {
+							slog.Warn("native tts speak", "err", err)
+						}
+					}(tgt)
+				}
 
 			case rstapp.Speaking:
 				dot := " "

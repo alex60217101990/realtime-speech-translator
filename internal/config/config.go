@@ -110,7 +110,24 @@ func Load() (Settings, error) {
 	if err := yaml.Unmarshal(b, &s); err != nil {
 		return Settings{}, err
 	}
+	normalise(&s)
 	return s, nil
+}
+
+// normalise rewrites legacy MT backend names from the previous
+// architecture so a config.yaml carried over from an older binary
+// does not log "backend unavailable" on every launch.
+//
+//	madlad / m2m100 → small100 (closest realtime tier in the new
+//	                            architecture; user can flip via UI)
+//	"" or unknown   → small100 (preserves Default's behaviour)
+func normalise(s *Settings) {
+	switch s.MTBackend {
+	case "small100", "opusmt", "off":
+		// already valid
+	default:
+		s.MTBackend = "small100"
+	}
 }
 
 // Save writes the settings to config.yaml using atomic rename.
