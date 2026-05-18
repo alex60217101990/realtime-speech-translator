@@ -29,12 +29,13 @@ const (
 )
 
 // App is the top-level Ebiten Game. State is kept under a single
-// mutex because the bindings (set via the AppBindings struct) push
-// new transcript / translation lines from a background goroutine.
+// mutex because the bindings push new transcript / translation
+// lines and audio buckets from background goroutines.
 type App struct {
 	theme  Theme
 	fonts  Fonts
 	bg     *backgroundCache
+	sphere *Sphere
 
 	mu          sync.RWMutex
 	status      sessionStatus
@@ -60,6 +61,7 @@ func NewApp() *App {
 	return &App{
 		theme:      DefaultTheme(),
 		fonts:      MustLoadFonts(),
+		sphere:     NewSphere(),
 		status:     statusWaiting,
 		sourceLang: "Русский",
 		targetLang: "English",
@@ -67,6 +69,12 @@ func NewApp() *App {
 		targetCode: "en",
 		hint:       "Нажмите ⌘ + K для быстрого старта",
 	}
+}
+
+// SetAudio forwards the latest audio snapshot to the sphere
+// shader. Safe for concurrent calls.
+func (a *App) SetAudio(s SphereAudio) {
+	a.sphere.SetAudio(s)
 }
 
 // SetStatus updates the header pill from the binding goroutine.
@@ -107,8 +115,12 @@ func (a *App) SetLanguages(srcCode, srcLabel, tgtCode, tgtLabel string) {
 	a.mu.Unlock()
 }
 
-// Update advances logic. Nothing to tick yet.
-func (a *App) Update() error { return nil }
+// Update advances logic. We only tick the sphere clock — every
+// other widget is event-driven.
+func (a *App) Update() error {
+	a.sphere.Tick(1.0 / 60.0)
+	return nil
+}
 
 // Draw paints one frame.
 func (a *App) Draw(screen *ebiten.Image) {
@@ -193,24 +205,12 @@ func roundedRectPath(x, y, w, h, r float32) *vector.Path {
 	return p
 }
 
-// drawCenter paints the central sphere region. Stage 3 replaces
-// this placeholder with the Kage ray-marched shader; for now we
-// render a soft blue glow disc that breathes with a sine wave so
-// the layout is visibly alive.
+// drawCenter paints the audio-reactive sphere into the centre
+// pane via the Kage shader. The shader is the visual anchor of
+// the Main tab; everything else is intentionally calmer so the
+// motion reads.
 func (a *App) drawCenter(dst *ebiten.Image, r image.Rectangle) {
-	cx := float32(r.Min.X + r.Dx()/2)
-	cy := float32(r.Min.Y + r.Dy()/2)
-	radius := float32(r.Dy()) / 2.5
-	// Outer halo.
-	drawFilledCircle(dst, cx, cy, radius*1.15,
-		color.NRGBA{R: 0x4C, G: 0x66, B: 0xBF, A: 0x22})
-	drawFilledCircle(dst, cx, cy, radius*1.05,
-		color.NRGBA{R: 0x6C, G: 0x88, B: 0xFF, A: 0x44})
-	// Body.
-	drawFilledCircle(dst, cx, cy, radius, a.theme.SphereInner)
-	// Inner highlight.
-	drawFilledCircle(dst, cx-radius*0.3, cy-radius*0.3, radius*0.35,
-		color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0x33})
+	a.sphere.Draw(dst, r)
 }
 
 // drawBottom paints the bottom control strip — large mic button in

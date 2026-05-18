@@ -1,0 +1,97 @@
+//kage:unit pixels
+
+// Audio-reactive sphere shader.
+//
+// The sphere is faked from a 2D distance field rather than a true 3D
+// mesh — at the resolution and motion of the UI mock the difference
+// is imperceptible, and a 2D shader composes cleanly with the rest of
+// the Ebiten vector layer (no separate render target needed).
+//
+// Uniforms (set by App.drawSphere each frame):
+//
+//	Time        wall-clock seconds since boot — drives noise rotation.
+//	Center      pixel coordinates of the disc centre in the host frame.
+//	Radius      base radius in pixels.
+//	Bass        0..1 — low-band audio energy; modulates surface
+//	            displacement amplitude. Hits the sphere hardest.
+//	Mid         0..1 — mid-band energy; modulates rotation rate.
+//	Treble      0..1 — high-band energy; boosts the rim glow.
+//	Rms         0..1 — overall loudness; breathes the outer halo.
+
+package main
+
+var Time float
+var Center vec2
+var Radius float
+var Bass float
+var Mid float
+var Treble float
+var Rms float
+
+// hash + smooth noise — small footprint, no texture sampler needed.
+func hash(p vec2) float {
+	return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453)
+}
+
+func noise(p vec2) float {
+	i := floor(p)
+	f := fract(p)
+	u := f * f * (3.0 - 2.0*f)
+	a := hash(i)
+	b := hash(i + vec2(1.0, 0.0))
+	c := hash(i + vec2(0.0, 1.0))
+	d := hash(i + vec2(1.0, 1.0))
+	return mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+}
+
+func fbm(p vec2) float {
+	v := 0.0
+	a := 0.5
+	for i := 0; i < 4; i++ {
+		v += a * noise(p)
+		p = p*2.0 + vec2(13.0, 7.0)
+		a *= 0.5
+	}
+	return v
+}
+
+func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
+	// Distance from this pixel to the sphere centre in pixels.
+	p := dstPos.xy - Center
+	d := length(p)
+
+	// Normalised radial coordinate in [-1, 1]ish.
+	r := Radius
+	rn := d / r
+
+	// Pre-compute rotation angle for the noise lookup so the
+	// fractal pattern spins with the Mid band.
+	ang := Time*0.25 + Mid*1.5
+	rot := mat2(cos(ang), -sin(ang), sin(ang), cos(ang))
+	q := rot * (p / r) * 1.6
+
+	// fBm noise across the sphere face, modulated by Bass on the
+	// inside — the bigger the bass, the more "boiling" texture.
+	n := fbm(q + vec2(Time*0.4, -Time*0.2))
+	displace := 0.08 + 0.35*Bass*n
+
+	// Sphere mask: inside the radius is full, outside fades over
+	// half a radius for the halo.
+	core := 1.0 - smoothstep(0.95, 1.0+displace*0.6, rn)
+	halo := 1.0 - smoothstep(1.0, 1.6+0.4*Rms, rn)
+
+	// Fresnel rim glow — visible only near the silhouette.
+	rim := pow(clamp(rn, 0.0, 1.0), 4.0) * core
+
+	// Colour mix: inner blue → outer magenta, with bass blending
+	// toward the magenta and rim adding a cyan kick.
+	innerCol := vec3(0.21, 0.40, 1.00)
+	outerCol := vec3(0.62, 0.27, 1.00)
+	rimCol := vec3(0.40, 0.78, 1.00)
+	base := mix(innerCol, outerCol, clamp(rn+0.2*Bass, 0.0, 1.0))
+	col := base + rimCol*rim*(0.4+1.6*Treble) + vec3(n*0.15)
+
+	// Compose alpha: full inside, soft halo outside.
+	alpha := core + halo*0.35*(0.5+0.5*Rms)
+	return vec4(col*alpha, alpha)
+}
