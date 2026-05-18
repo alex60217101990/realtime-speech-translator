@@ -216,11 +216,25 @@ func DefaultToneCtcConfig() Config {
 	c.Rule2MinTrailingSilenceSec = 0.6
 	c.Rule3MinUtteranceLengthSec = 10
 
-	// DSP chain explicitly disabled — see the comment above.
+	// DSP chain — spectral shaping stays OFF (see top comment),
+	// but a gentle AGC is on by default because T-one was trained
+	// on G.711 audio that was loudness-normalised at the codec.
+	// A quiet, distant mic produces a signal that is in-spectrum
+	// but out-of-level, and the CTC head responds by dropping
+	// short utterances and head/tail phonemes.
+	//
+	// The AGC only scales amplitude; it does not change the
+	// spectrum, so it does not push the signal off the raw-PCM
+	// distribution the model expects. Parameters err on the side
+	// of slow ramps and a low ceiling so we do not turn floor
+	// noise into hiss during pauses.
 	c.EnablePreEmphasis = false
 	c.TelephonyBandpass = false
 	c.PreEmphasisAlpha = 0
-	c.EnableAGC = false
+	c.EnableAGC = true
+	c.AGCTargetRMS = 0.12 // ≈ -18 dBFS, telephony-typical
+	c.AGCMaxGain = 6
+	c.AGCMinRMS = 0.003 // gate at ~-50 dBFS so we still amplify quiet speech
 
 	return c
 }
@@ -457,6 +471,10 @@ func New(cfg Config) (*Engine, error) {
 			TargetRMS: cfg.AGCTargetRMS,
 			MaxGain:   cfg.AGCMaxGain,
 			MinRMS:    cfg.AGCMinRMS,
+			// Slow ramp: ~1.1 dB/chunk vs the default 2 dB.
+			// Pairs better with T-one which is sensitive to
+			// abrupt amplitude changes.
+			MaxStep: 0.12,
 		}
 	}
 	return e, nil

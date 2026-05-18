@@ -158,9 +158,18 @@ type AGC struct {
 	MinRMS    float32
 	Tau       float32
 
+	// MaxStep caps fractional gain change per ProcessInPlace call
+	// (0.20 default ≈ ±2 dB/chunk). Lower values give a slower,
+	// more stable AGC — useful when the downstream model is
+	// sensitive to abrupt level changes (T-one raw-PCM CTC).
+	MaxStep float32
+
 	emaRMS float32 // smoothed input RMS
 	gain   float32 // smoothed gain applied last chunk
 }
+
+// CurrentGain returns the most recent applied gain (for UI / status).
+func (a *AGC) CurrentGain() float32 { return a.gain }
 
 // ProcessInPlace updates the gain estimate from the chunk's RMS and
 // applies the (rate-limited) gain in place.
@@ -206,15 +215,19 @@ func (a *AGC) ProcessInPlace(samples []float32) {
 			target = 0.1
 		}
 	}
-	// Rate-limit gain change: at most ~20 % per chunk in either
-	// direction. At a typical 100 ms chunk this is ~2 dB/chunk —
-	// fast enough to track ordinary level shifts (mic moved closer,
-	// quiet voice rising), slow enough to ignore single-chunk
-	// transients (a cough, a key click).
-	if target > a.gain*1.2 {
-		target = a.gain * 1.2
-	} else if target < a.gain*0.8 {
-		target = a.gain * 0.8
+	// Rate-limit gain change. Default 20 % per chunk; overridable
+	// via MaxStep so callers tuning for raw-PCM ASR models (T-one)
+	// can pick a gentler ramp that does not pump the signal.
+	step := a.MaxStep
+	if step <= 0 {
+		step = 0.20
+	}
+	up := 1 + step
+	down := 1 - step
+	if target > a.gain*up {
+		target = a.gain * up
+	} else if target < a.gain*down {
+		target = a.gain * down
 	}
 	a.gain = target
 
