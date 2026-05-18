@@ -16,7 +16,7 @@ third_party/build/
 docs/obsidian/.obsidian/
 graphify-out/
 dist/
-/bin//translator
+/translator
 /probe
 /stt-mic
 /tts-say
