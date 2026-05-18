@@ -140,6 +140,15 @@ type Session struct {
 	// Rolling last-N timings, stored as ns. Loaded by the UI poll.
 	mtLastNs  atomic.Uint64
 	ttsLastNs atomic.Uint64
+
+	// Half-duplex gate: while the TTS engine is emitting audio we
+	// must not feed mic capture into the recognizer, otherwise the
+	// loudspeaker → mic loop spirals into a feedback recursion where
+	// the recognizer transcribes its own previous output. Set to
+	// the wall-clock end of the current Speak (plus a small tail)
+	// every time runTTS emits.
+	muteUntilNs atomic.Int64
+	micDropped  atomic.Uint64
 }
 
 // New constructs the Session, opens the audio devices and loads the
@@ -179,9 +188,18 @@ func New(cfg Config) (*Session, error) {
 		ttsQ:   make(chan string, cfg.TTSQueue),
 	}
 
+	// Wrap stt.Push with a half-duplex gate so audio captured while
+	// TTS is playing never reaches the recognizer.
+	push := func(samples []float32) {
+		if time.Now().UnixNano() < s.muteUntilNs.Load() {
+			s.micDropped.Add(1)
+			return
+		}
+		s.stt.Push(samples)
+	}
 	cap, err := capture.New(
 		capture.Config{SampleRate: cfg.STT.SampleRate, Channels: 1},
-		s.stt.Push,
+		push,
 	)
 	if err != nil {
 		_ = sttEngine.Close()
@@ -401,9 +419,23 @@ func (s *Session) runTTS(ctx context.Context) {
 			for chunk := range chunks {
 				totalSamples += len(chunk.Samples)
 				s.pumpToPlayback(ctx, chunk.Samples)
+				// Refresh the half-duplex mute on every chunk: we
+				// know we will play at least this many more samples,
+				// so push the mute deadline forward by that much
+				// plus a 400 ms tail for the loudspeaker → mic
+				// transit and the ring still draining.
+				sr := s.tts.SampleRate()
+				if sr > 0 {
+					playMs := int64(len(chunk.Samples)) * 1000 / int64(sr)
+					deadline := time.Now().Add(time.Duration(playMs+400) * time.Millisecond)
+					s.muteUntilNs.Store(deadline.UnixNano())
+				}
 			}
 			elapsed := time.Since(start)
 			s.ttsLastNs.Store(uint64(elapsed.Nanoseconds()))
+			// Final mute hold-down so the tail of playback still
+			// drains without feeding back into STT.
+			s.muteUntilNs.Store(time.Now().Add(500 * time.Millisecond).UnixNano())
 			s.log.Info("tts done",
 				"text", trunc(text, 60),
 				"samples", totalSamples,
@@ -544,6 +576,13 @@ type Stats struct {
 	// Queue pressure.
 	MTDropped  uint64
 	TTSDropped uint64
+
+	// MicMutedDropped is the count of mic-callback chunks that were
+	// dropped on the floor because the half-duplex gate was active
+	// (TTS playing). Useful for diagnosing "the app does not hear
+	// me" complaints — if this counter is growing while you speak,
+	// playback is bleeding into the gate.
+	MicMutedDropped uint64
 }
 
 // Stats returns a point-in-time snapshot for the UI status line.
@@ -569,6 +608,7 @@ func (s *Session) Stats() Stats {
 	st.TTSDropped = s.ttsDrops.Load()
 	st.MTLast = time.Duration(s.mtLastNs.Load())
 	st.TTSLast = time.Duration(s.ttsLastNs.Load())
+	st.MicMutedDropped = s.micDropped.Load()
 	return st
 }
 
