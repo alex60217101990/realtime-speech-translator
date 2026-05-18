@@ -43,7 +43,7 @@ func drawRoundRectBorder(dst *ebiten.Image, r image.Rectangle, radius, width flo
 // drawFilledCircle is the same trick for circles — used by the
 // mic / language switch / end-call buttons.
 func drawFilledCircle(dst *ebiten.Image, cx, cy, r float32, c color.NRGBA) {
-	vector.DrawFilledCircle(dst, cx, cy, r, c, true)
+	vector.FillCircle(dst, cx, cy, r, c, true)
 }
 
 func drawCircleBorder(dst *ebiten.Image, cx, cy, r, width float32, c color.NRGBA) {

@@ -1,23 +1,31 @@
 //kage:unit pixels
 
-// Audio-reactive cosmic nebula sphere.
+// Audio-reactive particle sphere with energy-field ripples.
 //
-// Layered effects, all on the same 2D distance field:
+// Visual reference: a dark sphere body covered with thousands of
+// discrete particles (varying brightness, twinkling, drifting),
+// with brighter magenta/blue clusters and a translucent rippling
+// energy field around the silhouette that pulses on audio.
 //
-//   1. Domain-warped fBm    — Inigo Quilez-style "octopus" swirl;
-//                             the surface looks like a moving
-//                             nebula, not a static gradient.
-//   2. Worley cells         — particle clusters (3x3 cellular noise)
-//                             that read as a swarm of dust grains
-//                             drifting across the body.
-//   3. Spiral arms          — angular brightness modulation pinned
-//                             to the radial coord; gives the sphere
-//                             a galaxy-like sense of rotation.
-//   4. Drifting palette     — three colour tokens (cool, warm, hot)
-//                             cross-fade on slow sines so the body
-//                             changes hue every few seconds.
-//   5. Twinkling stars      — sparse hash-thresholded bright dots.
-//   6. Crisp Fresnel rim    — bright outline + outer halo.
+// Layers, in render order:
+//
+//   1. Dark inner body         deep navy fill, masks particles.
+//   2. Cluster nebula          slow fBm of magenta/cyan accents
+//                              behind the particles — gives the
+//                              "constellation" depth.
+//   3. Particles               64x64 cell grid, 60% populated, each
+//                              with hash-derived brightness +
+//                              independent twinkle phase. Bass
+//                              displaces particles along a flow
+//                              field so they appear to converge /
+//                              disperse on the beat.
+//   4. Bright accent stars     a separate sparse layer of brighter
+//                              key stars that punctuate the body.
+//   5. Fresnel rim             crisp white-blue outline.
+//   6. Force-field ripples     concentric rings outside the sphere
+//                              that shrink inward, fade with
+//                              distance, intensify on Treble.
+//   7. Halo                    soft outer breath, scales on Rms.
 
 package main
 
@@ -49,7 +57,7 @@ func noise(p vec2) float {
 func fbm(p vec2) float {
 	v := 0.0
 	a := 0.5
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 4; i++ {
 		v += a * noise(p)
 		p = p*2.02 + vec2(13.0, 7.0)
 		a *= 0.5
@@ -57,47 +65,77 @@ func fbm(p vec2) float {
 	return v
 }
 
-// Domain warping (Quilez): warp twice for the "octopus" / "nebula
-// tendril" effect — single-pass fBm cannot produce these long
-// swirling filaments on its own.
-func warp(uv vec2, t float) float {
-	q := vec2(fbm(uv+vec2(0.0, 0.0)), fbm(uv+vec2(5.2, 1.3)))
-	r := vec2(
-		fbm(uv+4.0*q+vec2(1.7, 9.2)+0.15*t),
-		fbm(uv+4.0*q+vec2(8.3, 2.8)+0.13*t),
-	)
-	return fbm(uv + 4.0*r)
-}
+// --- particle layers ------------------------------------------------------
 
-// Worley / cellular noise — returns distance to the nearest
-// jittered cell centre. We use 3x3 instead of the textbook 5x5
-// neighbourhood; at our scale the visible artefacts of the
-// smaller window are below the dust-particle threshold anyway.
-func worley(uv vec2) float {
-	g := floor(uv)
-	f := fract(uv)
-	d := 1.0
-	for y := -1; y <= 1; y++ {
-		for x := -1; x <= 1; x++ {
-			off := vec2(float(x), float(y))
-			c := g + off
-			p := vec2(hash(c), hash(c+vec2(1.7, 9.2)))
-			d = min(d, length(off+p-f))
-		}
-	}
-	return d
-}
+// Particles — dense grid of small dots. Bass + audio modulate a
+// flow-field displacement so the swarm visibly contracts toward
+// hot spots and re-disperses when the beat decays.
+//
+// density   cells per radius (sets grain size; 64 = thousands of
+//           particles across the body).
+// pick      hash threshold; 0.4 → ~60% of cells host a particle.
+// twinkle   per-particle phase from hash, so the swarm never feels
+//           synchronized.
+func particles(uv vec2, t float, bass float, mid float) float {
+	// Slow flow field for converge / disperse.
+	flow := vec2(
+		fbm(uv*0.7+vec2(t*0.10, 0.0)),
+		fbm(uv*0.7+vec2(0.0, t*0.10)),
+	) - 0.5
 
-// Twinkling stars overlay — small mask of bright pinpoints.
-func stars(uv vec2, t float) float {
-	g := uv * 32.0
+	// Bass collapses particles inward toward field nodes; mid
+	// rotates the displacement slightly so the contraction is
+	// not radial.
+	displace := flow * (0.02 + 0.10*bass)
+	rot := mat2(cos(mid), -sin(mid), sin(mid), cos(mid))
+	uv = uv - rot*displace
+
+	g := uv * 64.0
 	cell := floor(g)
 	jitter := vec2(hash(cell), hash(cell+vec2(7.3, 1.7)))
 	pos := cell + jitter
 	d := distance(g, pos)
-	pick := step(0.90, hash(cell+vec2(3.1, 5.7)))
-	tw := 0.5 + 0.5*sin(t*5.0+hash(cell)*60.0)
-	return smoothstep(0.16, 0.0, d) * tw * pick
+
+	pick := step(0.40, hash(cell+vec2(3.1, 5.7)))
+	bright := 0.25 + 0.75*hash(cell+vec2(11.1, 13.3))
+	tw := 0.55 + 0.45*sin(t*(2.0+hash(cell)*4.0)+hash(cell)*60.0)
+
+	return smoothstep(0.18, 0.0, d) * pick * bright * tw
+}
+
+// Accent stars — sparser, brighter layer on top of the particles
+// so the eye locks onto a few key bright points.
+func accentStars(uv vec2, t float) float {
+	g := uv * 18.0
+	cell := floor(g)
+	jitter := vec2(hash(cell+vec2(0.1, 0.2)), hash(cell+vec2(0.3, 0.4)))
+	pos := cell + jitter
+	d := distance(g, pos)
+	pick := step(0.93, hash(cell+vec2(7.7, 3.3)))
+	tw := 0.6 + 0.4*sin(t*4.0+hash(cell)*100.0)
+	return smoothstep(0.12, 0.0, d) * pick * tw
+}
+
+// --- energy field outside ------------------------------------------------
+
+// Concentric ripple rings + angular streaks, faded with distance.
+// Visible only outside the sphere (rn > 1).
+func forceField(rn float, ang float, t float, audio float) float {
+	if rn < 1.0 {
+		return 0.0
+	}
+	// 5 ring set inside the halo band [1.0, 1.4]; they shrink
+	// inward over time (negative phase) so the "shield" looks
+	// like it's being struck and ripples toward the body.
+	band := smoothstep(1.45, 1.02, rn)
+	rings := sin((rn-1.0)*38.0-t*3.5) * 0.5 + 0.5
+	rings = pow(rings, 2.0)
+
+	// Angular streaks running around the surface — modest count
+	// so they read as direction lines, not stripes.
+	streaks := pow(sin(ang*7.0+t*1.2)*0.5+0.5, 4.0)
+
+	return band * rings * (0.45 + 0.55*audio + 0.30*streaks)
 }
 
 // --- main fragment -------------------------------------------------------
@@ -107,72 +145,69 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 	r := Radius
 	rn := length(p) / r
 
-	// Skip the wasted area beyond the halo so fragment cost
-	// drops on the envelope-rect corners.
-	if rn > 1.45 {
+	if rn > 1.55 {
 		return vec4(0.0)
 	}
 
 	uv := p / r
 
-	// Sphere body mask + soft halo. Bass slightly inflates the
-	// silhouette so a loud beat visibly thumps the outline.
-	displace := 0.04 * Bass
+	// Body masks — sphere outline plus the soft halo behind it.
+	displace := 0.03 * Bass
 	core := 1.0 - smoothstep(0.985+displace, 1.02+displace, rn)
 	halo := 1.0 - smoothstep(1.0, 1.4+0.18*Rms, rn)
-	halo = halo * halo
+	halo = halo * halo * 0.55
 
-	// Rotated UV for the nebula texture; rotation speed rides Mid.
-	ang := Time*0.18 + Mid*1.0
-	rot := mat2(cos(ang), -sin(ang), sin(ang), cos(ang))
-	suv := rot * uv * 1.4
+	// Dark body fill — deep navy with a slight magenta tint near
+	// the rim so the silhouette never looks dead-flat.
+	bodyDark := vec3(0.04, 0.05, 0.12)
+	bodyEdge := vec3(0.12, 0.06, 0.20)
+	body := mix(bodyDark, bodyEdge, rn*rn)
 
-	// Domain-warped fBm — the nebula.
-	neb := warp(suv+vec2(Time*0.06, -Time*0.04), Time)
+	// Cluster nebula behind the particles — large blobs of warm /
+	// cool tint that drift slowly. This is the visible "depth"
+	// behind the dust.
+	ang := atan2(uv.y, uv.x)
+	suv := uv*1.3 + vec2(cos(ang)*0.3, sin(ang)*0.3)
+	cluster := fbm(suv*1.6 + vec2(Time*0.10, -Time*0.07))
+	cluster = pow(cluster, 1.4)
 
-	// Worley particle clusters.
-	wuv := suv*5.0 + vec2(Time*0.2, -Time*0.15)
-	wd := worley(wuv)
-	particles := pow(1.0-smoothstep(0.0, 0.18, wd), 1.6)
+	// Drifting palette so the cluster colour shifts every few
+	// seconds without becoming metronomic.
+	t1 := 0.5 + 0.5*sin(Time*0.09)
+	t2 := 0.5 + 0.5*sin(Time*0.13+1.7)
+	colA := mix(vec3(0.18, 0.10, 0.55), vec3(0.60, 0.15, 0.85), t1)
+	colB := mix(vec3(0.10, 0.30, 0.85), vec3(0.20, 0.70, 1.00), t2)
+	clusterCol := mix(colB, colA, cluster) * cluster * 0.45
 
-	// Spiral arms — angular modulation pinned to the radial coord
-	// gives the body a galaxy-like rotation, more interesting than
-	// pure radial gradients.
-	angP := atan2(uv.y, uv.x)
-	spiral := angP*2.0 - rn*5.0 + Time*0.6
-	armBri := 0.5 + 0.5*sin(spiral)
+	// Particle dust — masked to the inside, brighter near the
+	// equator (1 - rn drop-off keeps the silhouette dark so we
+	// can see the rim).
+	innerFalloff := smoothstep(1.0, 0.5, rn)
+	dust := particles(uv, Time, Bass, Mid) * innerFalloff
+	dustCol := mix(vec3(0.55, 0.70, 1.00), vec3(0.90, 0.50, 1.00), cluster)
+	dust *= 1.4 + 0.6*Bass
 
-	// Drifting palette — three colour tokens cross-fade on slow
-	// sines so the body's tint changes every few seconds without
-	// looking metronomic. Treble bumps the hot accent.
-	t1 := 0.5 + 0.5*sin(Time*0.11)
-	t2 := 0.5 + 0.5*sin(Time*0.07+1.7)
-	cCool := mix(vec3(0.25, 0.55, 1.00), vec3(0.55, 0.25, 1.00), t1)
-	cWarm := mix(vec3(1.00, 0.35, 0.70), vec3(0.30, 0.85, 1.00), t2)
-	cHot := vec3(1.00, 0.95, 0.75) * (0.85 + 0.5*Treble)
+	// Accent stars — a few bright key points.
+	acc := accentStars(uv, Time) * innerFalloff
+	accCol := vec3(1.00, 0.95, 0.85) * 1.6
 
-	// Mix: nebula chooses between cool/warm, particles pull toward
-	// the hot accent, arm brightness modulates the whole thing.
-	base := mix(cCool, cWarm, neb)
-	base = mix(base, cHot, particles*0.65)
-	base *= 0.55 + 0.55*armBri
+	// Fresnel rim — crisp outline.
+	rim := pow(clamp(rn, 0.0, 1.0), 24.0) * core
+	rimCol := vec3(0.65, 0.85, 1.00) * (0.9 + 1.6*Treble)
 
-	// Fresnel rim — narrow bright band just inside the edge.
-	rim := pow(clamp(rn, 0.0, 1.0), 22.0)
-	rim *= core * (0.9 + 1.6*Treble)
+	// Force-field ripples outside the body.
+	field := forceField(rn, ang, Time, 0.30+0.7*Rms)
+	fieldCol := vec3(0.40, 0.75, 1.00) * (0.4 + 1.2*Treble)
 
-	// Stars on top of the body — masked to the inner area so they
-	// do not bleed onto the rim and read as one continuous edge.
-	starMask := core * (1.0 - smoothstep(0.4, 0.95, rn))
-	starPix := stars(uv*1.3, Time) * starMask
-	starCol := vec3(0.85, 0.95, 1.00) * starPix * 1.6
+	// Compose.
+	col := vec3(0.0)
+	col += (body + clusterCol) * core
+	col += dustCol * dust * core
+	col += accCol * acc * core
+	col += rimCol * rim
+	col += fieldCol * field
+	col += mix(colA, colB, 0.5) * halo * 0.30 * (0.5 + 0.5*Rms)
 
-	// Halo colour borrows from the active palette so the outer
-	// breath drifts in tone with the body.
-	haloCol := mix(cCool, cWarm, 0.5+0.5*sin(Time*0.09))
-
-	col := base*core + cHot*rim*1.4 + starCol + haloCol*halo*0.45
-	alpha := clamp(core+halo*0.5+rim, 0.0, 1.0)
-
+	alpha := clamp(core+halo*0.5+rim+field*0.6, 0.0, 1.0)
 	return vec4(col*alpha, alpha)
 }
