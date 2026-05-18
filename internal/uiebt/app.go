@@ -203,10 +203,11 @@ func (a *App) Draw(screen *ebiten.Image) {
 	translation := append([]Card(nil), a.translation...)
 	srcCode, srcLabel := a.sourceCode, a.sourceLang
 	tgtCode, tgtLabel := a.targetCode, a.targetLang
+	status := a.status
 	a.mu.RUnlock()
 
 	r := LayoutFor(bounds.Dx(), bounds.Dy())
-	a.drawHeader(screen, r.Header)
+	a.drawHeader(screen, r.Header, status)
 	a.drawPane(screen, r.Left, PaneHeader{Flag: srcCode, Label: srcLabel}, transcript)
 	a.drawPane(screen, r.Right, PaneHeader{Flag: tgtCode, Label: tgtLabel}, translation)
 	a.drawCenter(screen, r.Center)
