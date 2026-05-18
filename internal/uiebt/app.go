@@ -3,11 +3,16 @@ package uiebt
 import (
 	"image"
 	"image/color"
+	"math"
 	"sync"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
+
+// mathSin is a single-call indirection so the idle helpers stay
+// import-free at the call site.
+func mathSin(x float64) float64 { return math.Sin(x) }
 
 // Window size matching the reference mock. Layout is responsive
 // from here on; this only sets the initial window dimension.
@@ -115,11 +120,65 @@ func (a *App) SetLanguages(srcCode, srcLabel, tgtCode, tgtLabel string) {
 	a.mu.Unlock()
 }
 
-// Update advances logic. We only tick the sphere clock — every
-// other widget is event-driven.
+// Update advances logic. We tick the sphere clock and feed it a
+// slow idle wave when no real audio is bound — this is what makes
+// the sphere visibly breathe on the splash / waiting-for-models
+// screen. Real audio buckets from cmd/translator-ui will overwrite
+// the idle values whenever they arrive.
 func (a *App) Update() error {
-	a.sphere.Tick(1.0 / 60.0)
+	const dt = 1.0 / 60.0
+	a.sphere.Tick(dt)
+	if !a.sphereHasAudio() {
+		t := a.sphereTime()
+		a.sphere.setAudioInternal(idleAudio(t))
+	}
 	return nil
+}
+
+// idleAudio synthesises a calm breathing wave so the sphere is
+// always visibly alive — useful before the audio bindings land
+// and during long pauses between user utterances.
+func idleAudio(t float64) SphereAudio {
+	// Three sine waves at different frequencies keep the
+	// modulation from looking metronomic.
+	bass := 0.18 + 0.12*sin01(t*0.6)
+	mid := 0.10 + 0.10*sin01(t*0.45+1.2)
+	treble := 0.08 + 0.07*sin01(t*1.1+2.7)
+	rms := 0.12 + 0.08*sin01(t*0.35+0.9)
+	return SphereAudio{
+		Bass:   float32(bass),
+		Mid:    float32(mid),
+		Treble: float32(treble),
+		Rms:    float32(rms),
+	}
+}
+
+// sin01 returns sin(x) remapped to [0, 1].
+func sin01(x float64) float64 {
+	return 0.5 + 0.5*sinFast(x)
+}
+
+// sinFast uses math.Sin; the wrapper exists so a future SIMD path
+// can swap it without touching the call sites.
+func sinFast(x float64) float64 {
+	return mathSin(x)
+}
+
+// sphereHasAudio returns true once SetAudio has been called from
+// outside with any non-zero value. Until then the Update loop
+// drives the sphere off the idle wave.
+func (a *App) sphereHasAudio() bool {
+	a.sphere.mu.RLock()
+	defer a.sphere.mu.RUnlock()
+	return a.sphere.externalDriven
+}
+
+// sphereTime exposes the sphere clock so the idle wave runs on the
+// same reference as the shader's Time uniform.
+func (a *App) sphereTime() float64 {
+	a.sphere.mu.RLock()
+	defer a.sphere.mu.RUnlock()
+	return a.sphere.time
 }
 
 // Draw paints one frame.

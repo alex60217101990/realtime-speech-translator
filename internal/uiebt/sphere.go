@@ -30,9 +30,10 @@ type SphereAudio struct {
 type Sphere struct {
 	shader *ebiten.Shader
 
-	mu   sync.RWMutex
-	a    SphereAudio
-	time float64
+	mu             sync.RWMutex
+	a              SphereAudio
+	time           float64
+	externalDriven bool // flipped true by the first SetAudio call
 }
 
 // NewSphere compiles the Kage shader. Panics on compile failure —
@@ -56,8 +57,21 @@ func (s *Sphere) Tick(dt float64) {
 }
 
 // SetAudio updates the bass / mid / treble / rms uniforms. Safe
-// for concurrent calls from the audio-bucket goroutine.
+// for concurrent calls from the audio-bucket goroutine. The first
+// non-idle call flips externalDriven; from then on the App's idle
+// wave stops overwriting these values.
 func (s *Sphere) SetAudio(a SphereAudio) {
+	s.mu.Lock()
+	s.a = a
+	if a.Bass != 0 || a.Mid != 0 || a.Treble != 0 || a.Rms != 0 {
+		s.externalDriven = true
+	}
+	s.mu.Unlock()
+}
+
+// setAudioInternal is used by the App's idle wave — it does not
+// flip externalDriven, so a real SetAudio later still takes over.
+func (s *Sphere) setAudioInternal(a SphereAudio) {
 	s.mu.Lock()
 	s.a = a
 	s.mu.Unlock()
