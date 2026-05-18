@@ -307,9 +307,14 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
+	// CTC online models (T-one) only support greedy_search inside
+	// sherpa; modified_beam_search is transducer-only. Force greedy
+	// for ToneCtc regardless of what the caller put in Config.
 	decoding := cfg.DecodingMethod
-	if decoding == "" {
+	if cfg.Kind == ModelToneCtc {
 		decoding = "greedy_search"
+	} else if decoding == "" {
+		decoding = "modified_beam_search"
 	}
 	maxPaths := cfg.MaxActivePaths
 	if maxPaths <= 0 {
