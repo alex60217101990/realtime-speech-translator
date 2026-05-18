@@ -53,8 +53,8 @@ import (
 )
 
 // Config bundles everything Session needs to wire the pipeline. STT
-// and TTS sub-configs are constructed by the cmd layer (it knows
-// model paths from the manifest); MT comes pre-built (Disabled by
+// is now a pre-built Backend (cmd layer chose between streaming
+// Engine and VadNemoEngine); MT comes pre-built (Disabled by
 // default), already wrapped in mt.Serial and any caching the cmd
 // chooses to apply.
 type Config struct {
@@ -62,7 +62,14 @@ type Config struct {
 	Source string
 	Target string
 
-	STT stt.Config
+	// STTBackend is the constructed stt.Backend. New(Config) takes
+	// it as-is — the cmd layer is responsible for the right backend
+	// flavour per model.
+	STTBackend stt.Backend
+	// STTSampleRate is the rate the backend was configured at; used
+	// to open the capture device at the matching rate.
+	STTSampleRate int
+
 	TTS tts.Config
 
 	// MT is the translation backend. Nil falls back to mt.Disabled
@@ -120,7 +127,7 @@ type Session struct {
 	log *slog.Logger
 
 	cap *capture.Capture
-	stt *stt.Engine
+	stt stt.Backend
 	tts *tts.Engine
 	pb  *playback.Playback
 	mt  mt.Engine
@@ -173,15 +180,17 @@ func New(cfg Config) (*Session, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	sttEngine, err := stt.New(cfg.STT)
-	if err != nil {
-		return nil, fmt.Errorf("app: stt: %w", err)
+	if cfg.STTBackend == nil {
+		return nil, errors.New("app: STTBackend required")
+	}
+	if cfg.STTSampleRate == 0 {
+		cfg.STTSampleRate = 16000
 	}
 
 	s := &Session{
 		cfg:    cfg,
 		log:    cfg.Logger,
-		stt:    sttEngine,
+		stt:    cfg.STTBackend,
 		mt:     cfg.MT,
 		events: make(chan Event, 32),
 		mtQ:    make(chan string, cfg.MTQueue),
@@ -198,11 +207,11 @@ func New(cfg Config) (*Session, error) {
 		s.stt.Push(samples)
 	}
 	cap, err := capture.New(
-		capture.Config{SampleRate: cfg.STT.SampleRate, Channels: 1},
+		capture.Config{SampleRate: cfg.STTSampleRate, Channels: 1},
 		push,
 	)
 	if err != nil {
-		_ = sttEngine.Close()
+		_ = cfg.STTBackend.Close()
 		return nil, fmt.Errorf("app: capture: %w", err)
 	}
 	s.cap = cap
@@ -211,7 +220,7 @@ func New(cfg Config) (*Session, error) {
 		ttsEngine, err := tts.New(cfg.TTS)
 		if err != nil {
 			_ = cap.Close()
-			_ = sttEngine.Close()
+			_ = cfg.STTBackend.Close()
 			return nil, fmt.Errorf("app: tts: %w", err)
 		}
 		s.tts = ttsEngine
@@ -229,7 +238,7 @@ func New(cfg Config) (*Session, error) {
 		if err != nil {
 			_ = ttsEngine.Close()
 			_ = cap.Close()
-			_ = sttEngine.Close()
+			_ = cfg.STTBackend.Close()
 			return nil, fmt.Errorf("app: playback: %w", err)
 		}
 		s.pb = pb

@@ -123,7 +123,7 @@ func DefaultCatalog() []Entry {
 		{
 			Kind:        KindSTT,
 			Name:        "streaming-t-one-russian",
-			DisplayName: "T-one Streaming (Russian)",
+			DisplayName: "T-one Streaming (Russian, telephony)",
 			License:     "Apache-2.0 (Voicekit T-Software DC)",
 			URL:         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-t-one-russian-2025-09-08.tar.bz2",
 			SizeBytes:   128_468_156,
@@ -134,6 +134,22 @@ func DefaultCatalog() []Entry {
 			},
 			RequiredFiles: []string{
 				"model.onnx", "tokens.txt",
+			},
+		},
+		{
+			Kind:        KindSTT,
+			Name:        "nemo-ctc-punct-giga-am-v3-russian",
+			DisplayName: "NeMo GigaAM v3 + Punct (Russian, offline)",
+			License:     "Free (Sber AI · GigaAM v3, Dec 2025)",
+			URL:         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-ctc-punct-giga-am-v3-russian-2025-12-16.tar.bz2",
+			SizeBytes:   163_286_197,
+			Tarball:     true,
+			Layout: map[string]string{
+				"model.int8.onnx": "model.int8.onnx",
+				"tokens.txt":      "tokens.txt",
+			},
+			RequiredFiles: []string{
+				"model.int8.onnx", "tokens.txt",
 			},
 		},
 		{

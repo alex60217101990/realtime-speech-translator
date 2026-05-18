@@ -311,7 +311,18 @@ type sessionState struct {
 // nativeTTS == nil when sherpa Piper loaded successfully or when
 // the host has no usable native synthesizer either.
 func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) {
-	sttDir, err := paths.STTDir(cfg.STTModel)
+	// Resolve "auto" / smart-pick into a concrete model name based
+	// on SourceLang and what the user actually has installed under
+	// <data>/models/stt/.
+	resolvedSTT, autoNote := resolveSTTModel(cfg)
+	if resolvedSTT == "" {
+		return nil, nil, fmt.Errorf("%w: no STT model installed under <data>/models/stt/", errModelsMissing)
+	}
+	if autoNote != "" {
+		slog.Info("stt auto-select", "picked", resolvedSTT, "reason", autoNote)
+	}
+
+	sttDir, err := paths.STTDir(resolvedSTT)
 	if err != nil {
 		return nil, nil, fmt.Errorf("stt dir: %w", err)
 	}
@@ -319,51 +330,29 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("vad path: %w", err)
 	}
-	// Detect ModelKind by which files are on disk. Transducer
-	// families ship encoder/decoder/joiner; T-one (CTC) ships a
-	// single model.onnx.
 	tokensPath := filepath.Join(sttDir, "tokens.txt")
 	if _, err := os.Stat(tokensPath); err != nil {
-		return nil, nil, fmt.Errorf("%w: stt/%s/tokens.txt", errModelsMissing, cfg.STTModel)
+		return nil, nil, fmt.Errorf("%w: stt/%s/tokens.txt", errModelsMissing, resolvedSTT)
 	}
 	if _, err := os.Stat(vadPath); err != nil {
 		return nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
 	}
 
-	// Pick the right defaults BEFORE filling paths so the per-kind
-	// DSP / endpoint / VAD knobs land correctly. We later commit
-	// the resolved Kind and paths.
-	var sttCfg stt.Config
-	switch {
-	case fileExists(filepath.Join(sttDir, "encoder.onnx")):
-		sttCfg = stt.DefaultConfig()
-		sttCfg.Kind = stt.ModelTransducer
-		sttCfg.Encoder = filepath.Join(sttDir, "encoder.onnx")
-		sttCfg.Decoder = filepath.Join(sttDir, "decoder.onnx")
-		sttCfg.Joiner = filepath.Join(sttDir, "joiner.onnx")
-		for _, leaf := range []string{"decoder.onnx", "joiner.onnx"} {
-			if !fileExists(filepath.Join(sttDir, leaf)) {
-				return nil, nil, fmt.Errorf("%w: stt/%s/%s", errModelsMissing, cfg.STTModel, leaf)
-			}
-		}
-	case fileExists(filepath.Join(sttDir, "model.onnx")):
-		sttCfg = stt.DefaultToneCtcConfig()
-		sttCfg.Kind = stt.ModelToneCtc
-		sttCfg.ToneCtcModel = filepath.Join(sttDir, "model.onnx")
-	default:
-		return nil, nil, fmt.Errorf("%w: stt/%s/(encoder|model).onnx", errModelsMissing, cfg.STTModel)
-	}
-	sttCfg.Tokens = tokensPath
-	sttCfg.VADModel = vadPath
-	sttCfg.NumThreads = cfg.Threads
-	// Settings VAD threshold overrides per-kind default — user
-	// always wins.
-	if cfg.VADThreshold > 0 {
-		sttCfg.VADThreshold = cfg.VADThreshold
+	// Backend factory: pick the right stt.Backend implementation by
+	// inspecting which model files are on disk.
+	//
+	//   - encoder.onnx           → streaming Zipformer transducer.
+	//   - model.onnx             → streaming T-one CTC.
+	//   - model.int8.onnx        → offline NeMo CTC (GigaAM family).
+	resolvedCfg := cfg
+	resolvedCfg.STTModel = resolvedSTT
+	sttBackend, kindName, err := buildSTTBackend(resolvedCfg, sttDir, tokensPath, vadPath)
+	if err != nil {
+		return nil, nil, err
 	}
 	slog.Info("stt backend resolved",
-		"model_name", cfg.STTModel,
-		"kind", sttKindName(sttCfg.Kind),
+		"model_name", resolvedSTT,
+		"kind", kindName,
 	)
 
 	var ttsCfg tts.Config
@@ -396,18 +385,84 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	}
 
 	sess, err := rstapp.New(rstapp.Config{
-		Source:     cfg.SourceLang,
-		Target:     cfg.TargetLang,
-		STT:        sttCfg,
-		TTS:        ttsCfg,
-		MT:         mtEngine,
-		TTSEnabled: ttsEnabled,
-		Logger:     slog.Default(),
+		Source:        cfg.SourceLang,
+		Target:        cfg.TargetLang,
+		STTBackend:    sttBackend,
+		STTSampleRate: 16000,
+		TTS:           ttsCfg,
+		MT:            mtEngine,
+		TTSEnabled:    ttsEnabled,
+		Logger:        slog.Default(),
 	})
 	if err != nil {
+		_ = sttBackend.Close()
 		return nil, nil, err
 	}
 	return sess, nativeFallback, nil
+}
+
+// buildSTTBackend picks the right stt.Backend by inspecting the
+// model directory on disk and returns it ready to Run.
+func buildSTTBackend(cfg config.Settings, sttDir, tokensPath, vadPath string) (stt.Backend, string, error) {
+	switch {
+	case fileExists(filepath.Join(sttDir, "encoder.onnx")):
+		// Streaming Zipformer transducer.
+		for _, leaf := range []string{"decoder.onnx", "joiner.onnx"} {
+			if !fileExists(filepath.Join(sttDir, leaf)) {
+				return nil, "", fmt.Errorf("%w: stt/%s/%s", errModelsMissing, cfg.STTModel, leaf)
+			}
+		}
+		c := stt.DefaultConfig()
+		c.Kind = stt.ModelTransducer
+		c.Encoder = filepath.Join(sttDir, "encoder.onnx")
+		c.Decoder = filepath.Join(sttDir, "decoder.onnx")
+		c.Joiner = filepath.Join(sttDir, "joiner.onnx")
+		c.Tokens = tokensPath
+		c.VADModel = vadPath
+		c.NumThreads = cfg.Threads
+		if cfg.VADThreshold > 0 {
+			c.VADThreshold = cfg.VADThreshold
+		}
+		e, err := stt.New(c)
+		if err != nil {
+			return nil, "", err
+		}
+		return e, "transducer (streaming Zipformer)", nil
+
+	case fileExists(filepath.Join(sttDir, "model.onnx")):
+		// Streaming T-one CTC.
+		c := stt.DefaultToneCtcConfig()
+		c.Kind = stt.ModelToneCtc
+		c.ToneCtcModel = filepath.Join(sttDir, "model.onnx")
+		c.Tokens = tokensPath
+		c.VADModel = vadPath
+		c.NumThreads = cfg.Threads
+		if cfg.VADThreshold > 0 {
+			c.VADThreshold = cfg.VADThreshold
+		}
+		e, err := stt.New(c)
+		if err != nil {
+			return nil, "", err
+		}
+		return e, "tone_ctc (T-one streaming)", nil
+
+	case fileExists(filepath.Join(sttDir, "model.int8.onnx")):
+		// Offline NeMo CTC (GigaAM v3 punct, GigaAM v2, etc.).
+		c := stt.DefaultVadNemoConfig()
+		c.NemoCTCModel = filepath.Join(sttDir, "model.int8.onnx")
+		c.Tokens = tokensPath
+		c.VADModel = vadPath
+		c.NumThreads = cfg.Threads
+		if cfg.VADThreshold > 0 {
+			c.VADThreshold = cfg.VADThreshold
+		}
+		e, err := stt.NewVadNemo(c)
+		if err != nil {
+			return nil, "", err
+		}
+		return e, "vad_nemo (offline NeMo CTC)", nil
+	}
+	return nil, "", fmt.Errorf("%w: stt/%s/(encoder|model|model.int8).onnx", errModelsMissing, cfg.STTModel)
 }
 
 // fileExists is the obvious helper; the os.Stat dance reads poorly
@@ -415,6 +470,64 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// resolveSTTModel returns the concrete STT directory name to load.
+// When cfg.STTModel is anything other than "" or "auto" the user's
+// explicit choice wins. Otherwise we pick the best installed model
+// for cfg.SourceLang from the priority table below; "auto" source
+// language falls back to the overall priority list.
+//
+// Priority lists are deliberately short and hard-coded — they match
+// the entries in internal/models/catalog.go. Anything not on the
+// list that the user installed manually is still picked up by the
+// "any installed" fallback.
+func resolveSTTModel(cfg config.Settings) (name, reason string) {
+	if cfg.STTModel != "" && cfg.STTModel != "auto" {
+		return cfg.STTModel, ""
+	}
+	root := modelsSubdir("stt")
+	installed := map[string]bool{}
+	for _, n := range listDirs(root) {
+		installed[n] = true
+	}
+	if len(installed) == 0 {
+		return "", ""
+	}
+
+	type priority []string
+	var order priority
+	switch strings.ToLower(cfg.SourceLang) {
+	case "ru":
+		order = priority{
+			"nemo-ctc-punct-giga-am-v3-russian",
+			"nemo-ctc-giga-am-v3-russian",
+			"nemo-ctc-giga-am-v2-russian",
+			"streaming-t-one-russian",
+		}
+	case "en":
+		order = priority{
+			"zipformer-streaming-en",
+		}
+	default: // "auto" or anything else — quality-first global priority.
+		order = priority{
+			"nemo-ctc-punct-giga-am-v3-russian",
+			"zipformer-streaming-en",
+			"nemo-ctc-giga-am-v3-russian",
+			"nemo-ctc-giga-am-v2-russian",
+			"streaming-t-one-russian",
+		}
+	}
+	for _, candidate := range order {
+		if installed[candidate] {
+			return candidate, fmt.Sprintf("source=%s, best installed match", nonEmpty(cfg.SourceLang, "auto"))
+		}
+	}
+	// Last resort: any installed model.
+	for n := range installed {
+		return n, "no preferred match; fell back to first installed"
+	}
+	return "", ""
 }
 
 func sttKindName(k stt.ModelKind) string {

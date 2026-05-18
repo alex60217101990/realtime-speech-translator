@@ -68,7 +68,10 @@ func Default() Settings {
 	return Settings{
 		SourceLang:   "ru",
 		TargetLang:   "en",
-		STTModel:     "streaming-t-one-russian",
+		// "auto" lets the cmd layer pick the best installed STT
+		// model for the configured SourceLang. Users can override
+		// in Settings to lock to a specific model name.
+		STTModel:     "auto",
 		MTBackend:    "small100",
 		TTSVoice:     "piper-en-amy-low",
 		Threads:      0,
