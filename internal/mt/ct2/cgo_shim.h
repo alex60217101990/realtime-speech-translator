@@ -33,6 +33,11 @@ void ct2_free(ct2_translator* t);
 // On success returns 0; *out_pieces is a malloc'd array of *out_n
 // nul-terminated UTF-8 strings (free via ct2_free_pieces).
 // On failure returns 1 and *err is populated.
+// repetition_penalty: >0 enables penalty (1.0 = neutral, typical 1.05-1.2).
+//   <=0 means leave at CT2 default.
+// no_repeat_ngram_size: >0 forbids n-gram repetition (typical 3). 0 disables.
+// Both knobs short-circuit greedy decoder loops on weird inputs and
+// usually shorten output length on noisy STT, so they cut wall time too.
 int ct2_translate(
     ct2_translator* t,
     const char* const* source_pieces,
@@ -41,6 +46,8 @@ int ct2_translate(
     int32_t n_prefix,
     int32_t beam_size,
     int32_t max_decoding_length,
+    float   repetition_penalty,
+    int32_t no_repeat_ngram_size,
     char*** out_pieces,
     int32_t* out_n,
     char** err);

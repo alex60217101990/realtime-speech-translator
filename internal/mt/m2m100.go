@@ -102,14 +102,27 @@ func (m *M2M100) Translate(src, srcLang, dstLang string) (string, error) {
 		return "", fmt.Errorf("m2m100: tokenize: %w", err)
 	}
 
-	sourcePieces := make([]string, 0, len(pieces)+1)
+	sourcePieces := make([]string, 0, len(pieces)+2)
 	sourcePieces = append(sourcePieces, srcTag)
 	sourcePieces = append(sourcePieces, pieces...)
+	// m2m100 / SMaLL-100 expect an explicit </s> at the end of the
+	// source sequence. Without it the decoder has no learned stopping
+	// signal and degenerates into repeating the highest-probability
+	// token until MaxDecodingLength is hit ("Test Test Test …",
+	// "I I I I …"). The token must be a literal sentinel — the
+	// model's vocab contains it as a single id.
+	sourcePieces = append(sourcePieces, "</s>")
 
 	outPieces, err := m.tr.Translate(sourcePieces, ct2.TranslateOptions{
 		BeamSize:           m.cfg.BeamSize,
 		MaxDecodingLength:  m.cfg.MaxDecodingLength,
 		TargetPrefixPieces: []string{dstTag},
+		// 1.05 + n-gram 3 is the standard m2m100 anti-loop setup
+		// from the perf branch. Degenerate repetitions on noisy
+		// STT input get cut short; well-formed input typically
+		// hits EOS earlier, shaving wall-time on every utterance.
+		RepetitionPenalty: 1.05,
+		NoRepeatNgramSize: 3,
 	})
 	if err != nil {
 		return "", fmt.Errorf("m2m100: translate: %w", err)

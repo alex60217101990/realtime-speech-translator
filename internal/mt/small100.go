@@ -93,14 +93,18 @@ func (m *SMaLL100) Translate(src, srcLang, dstLang string) (string, error) {
 		return "", fmt.Errorf("small100: tokenize: %w", err)
 	}
 
-	// SMaLL-100 tagging: encoder = ["__tgt__", pieces…], decoder = nil.
-	sourcePieces := make([]string, 0, len(pieces)+1)
+	// SMaLL-100 tagging: encoder = ["__tgt__", pieces…, </s>],
+	// decoder = nil. The trailing </s> is critical — see m2m100.go.
+	sourcePieces := make([]string, 0, len(pieces)+2)
 	sourcePieces = append(sourcePieces, dstTag)
 	sourcePieces = append(sourcePieces, pieces...)
+	sourcePieces = append(sourcePieces, "</s>")
 
 	outPieces, err := m.tr.Translate(sourcePieces, ct2.TranslateOptions{
 		BeamSize:          m.cfg.BeamSize,
 		MaxDecodingLength: m.cfg.MaxDecodingLength,
+		RepetitionPenalty: 1.05,
+		NoRepeatNgramSize: 3,
 	})
 	if err != nil {
 		return "", fmt.Errorf("small100: translate: %w", err)

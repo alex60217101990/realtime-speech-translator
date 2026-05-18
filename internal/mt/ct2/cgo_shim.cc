@@ -78,6 +78,8 @@ int ct2_translate(
     int32_t n_prefix,
     int32_t beam_size,
     int32_t max_decoding_length,
+    float   repetition_penalty,
+    int32_t no_repeat_ngram_size,
     char*** out_pieces,
     int32_t* out_n,
     char** err) {
@@ -96,6 +98,8 @@ int ct2_translate(
         ctranslate2::TranslationOptions opts;
         if (beam_size > 0) opts.beam_size = beam_size;
         if (max_decoding_length > 0) opts.max_decoding_length = max_decoding_length;
+        if (repetition_penalty > 0.0f) opts.repetition_penalty = repetition_penalty;
+        if (no_repeat_ngram_size > 0) opts.no_repeat_ngram_size = no_repeat_ngram_size;
         // Keep latency bounded — sampling stays at greedy by default.
 
         std::vector<ctranslate2::TranslationResult> results;
