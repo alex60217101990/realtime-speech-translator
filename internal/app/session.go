@@ -168,6 +168,12 @@ const (
 	stitchMaxFragmentSec = 4                      // a Final longer than this is flushed on its own
 )
 
+// Half-duplex tail (mute hold-down after the playback ring drains).
+// 1.5 s covers room reverberation + Silero VAD onset latency + ASR
+// segment release; anything shorter lets the speaker tail bleed
+// into a new utterance the recognizer transcribes back as garbage.
+const halfDuplexTailMs = 1500 * time.Millisecond
+
 // stitchState buffers consecutive Finals that arrive within
 // stitchWindow of each other and lack terminal punctuation, so the
 // MT engine receives one coherent sentence instead of two clauses.
@@ -618,7 +624,7 @@ func (s *Session) runTTS(ctx context.Context) {
 				}
 				ringSamples := s.pb.Ring().Len()
 				drainMs := int64(ringSamples) * 1000 / int64(sr)
-				deadline := time.Now().Add(time.Duration(drainMs+700) * time.Millisecond)
+				deadline := time.Now().Add(time.Duration(drainMs)*time.Millisecond + halfDuplexTailMs)
 				cur := s.muteUntilNs.Load()
 				if deadline.UnixNano() > cur {
 					s.muteUntilNs.Store(deadline.UnixNano())
@@ -634,9 +640,11 @@ func (s *Session) runTTS(ctx context.Context) {
 			s.ttsLastNs.Store(uint64(elapsed.Nanoseconds()))
 
 			// Final hold-down: keep the gate active until the ring
-			// is provably empty + 700 ms. Poll every 50 ms so we
-			// release the mic the moment playback finishes.
-			s.waitPlaybackDrain(ctx, 700*time.Millisecond)
+			// is provably empty + halfDuplexTailMs (room
+			// reverberation + Silero VAD onset latency + ASR
+			// segment release headroom). Poll every 50 ms so we
+			// release the mic the moment everything has settled.
+			s.waitPlaybackDrain(ctx, halfDuplexTailMs)
 
 			s.log.Info("tts done",
 				"text", trunc(text, 60),
