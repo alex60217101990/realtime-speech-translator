@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -51,6 +52,11 @@ import (
 
 // version is filled at build time via -ldflags "-X main.version=...".
 var version = "dev"
+
+// errModelsMissing flags a buildSession failure that the caller can
+// recover from by installing the missing artefacts through the
+// Models tab. Anything else is a hard error.
+var errModelsMissing = errors.New("models missing")
 
 func main() {
 	src := flag.String("source", "", "override source language (ISO-639-1 or 'auto')")
@@ -88,22 +94,25 @@ func main() {
 		cfg.TTSEnabled = false
 	}
 
-	session, nativeTTS, err := buildSession(cfg)
-	if err != nil {
-		slog.Error("build session", "err", err)
-		os.Exit(1)
-	}
-	if nativeTTS != nil {
-		slog.Info("piper unavailable; using native TTS fallback", "backend", nativeTTS.Backend())
-	}
-
 	a := app.NewWithID("io.github.alex60217101990.rstranslator")
 	w := a.NewWindow("Realtime Speech Translator")
 	w.Resize(fyne.NewSize(720, 520))
 
 	live, liveCtl := buildLiveTab(cfg)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// sessionState owns the lifecycle of the rstapp.Session so we
+	// can rebuild it after the user installs missing models without
+	// restarting the whole binary.
+	var (
+		state    sessionState
+		stateMu  sync.Mutex
+		tryStart func()
+	)
+
 	tabs := container.NewAppTabs()
+
 	rebuildSettings := func() {
 		settings := ui.SettingsScreen(w, cfg, ui.SettingsCallbacks{
 			AvailableSTTModels: listDirs(modelsSubdir("stt")),
@@ -111,10 +120,14 @@ func main() {
 			OnSave: func(s config.Settings) {
 				slog.Info("settings saved", "stt", s.STTModel, "mt", s.MTBackend, "tts", s.TTSVoice)
 				cfg = s
+				// Reload the session so the new model paths take
+				// effect immediately. tryStart handles cleanup of
+				// any previous session.
+				if tryStart != nil {
+					tryStart()
+				}
 			},
 		})
-		// Replace the Settings tab in place so dropdowns refresh
-		// after a model install completes.
 		if len(tabs.Items) > 1 {
 			tabs.Items[1].Content = settings
 			tabs.Refresh()
@@ -127,6 +140,9 @@ func main() {
 		OnInstalled: func(e models.Entry) {
 			slog.Info("model installed", "kind", e.Kind, "name", e.Name)
 			rebuildSettings()
+			if tryStart != nil {
+				tryStart()
+			}
 		},
 	})
 
@@ -136,22 +152,72 @@ func main() {
 
 	w.SetContent(tabs)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := session.Start(ctx); err != nil {
-		slog.Error("session start", "err", err)
-		cancel()
-		_ = session.Close()
-		os.Exit(1)
+	tryStart = func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+
+		if state.session != nil {
+			_ = state.session.Stop()
+			_ = state.session.Close()
+			state = sessionState{}
+		}
+
+		session, nativeTTS, err := buildSession(cfg)
+		if err != nil {
+			if errors.Is(err, errModelsMissing) {
+				slog.Warn("session not started; install models via the Models tab", "err", err)
+				fyne.Do(func() {
+					ctl := liveCtl
+					ctl.partial.SetText("")
+					ctl.translation.SetText("Install STT + VAD models in the Models tab to start.")
+					ctl.status.SetText(fmt.Sprintf("v%s · waiting for models", version))
+				})
+				return
+			}
+			slog.Error("build session", "err", err)
+			fyne.Do(func() {
+				liveCtl.translation.SetText("Session error: " + err.Error())
+			})
+			return
+		}
+		if nativeTTS != nil {
+			slog.Info("piper unavailable; using native TTS fallback", "backend", nativeTTS.Backend())
+		}
+		if err := session.Start(ctx); err != nil {
+			slog.Error("session start", "err", err)
+			_ = session.Close()
+			fyne.Do(func() {
+				liveCtl.translation.SetText("Start failed: " + err.Error())
+			})
+			return
+		}
+		state.session = session
+		state.nativeTTS = nativeTTS
+		fyne.Do(func() {
+			liveCtl.translation.SetText("")
+		})
+		go pumpEvents(ctx, session, liveCtl, nativeTTS)
 	}
 
-	go pumpEvents(ctx, session, liveCtl, nativeTTS)
+	tryStart()
 
 	w.SetOnClosed(func() {
 		cancel()
-		_ = session.Close()
+		stateMu.Lock()
+		if state.session != nil {
+			_ = state.session.Close()
+		}
+		stateMu.Unlock()
 	})
 
 	w.ShowAndRun()
+}
+
+// sessionState bundles the live session and the optional native TTS
+// fallback so the lifecycle goroutine can swap both atomically.
+type sessionState struct {
+	session   *rstapp.Session
+	nativeTTS *native.Engine
 }
 
 // buildSession resolves all model paths from the settings + paths
@@ -173,11 +239,30 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("vad path: %w", err)
 	}
+	// Verify the STT + VAD artefacts exist BEFORE handing them to
+	// sherpa-onnx. Without this, every launch with missing files
+	// surfaces a noisy "Errors in config!" from the C side and
+	// hides the actionable signal for the user.
+	sttFiles := map[string]string{
+		"encoder.onnx": filepath.Join(sttDir, "encoder.onnx"),
+		"decoder.onnx": filepath.Join(sttDir, "decoder.onnx"),
+		"joiner.onnx":  filepath.Join(sttDir, "joiner.onnx"),
+		"tokens.txt":   filepath.Join(sttDir, "tokens.txt"),
+	}
+	for leaf, path := range sttFiles {
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, fmt.Errorf("%w: stt/%s/%s", errModelsMissing, cfg.STTModel, leaf)
+		}
+	}
+	if _, err := os.Stat(vadPath); err != nil {
+		return nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
+	}
+
 	sttCfg := stt.DefaultConfig()
-	sttCfg.Encoder = filepath.Join(sttDir, "encoder.onnx")
-	sttCfg.Decoder = filepath.Join(sttDir, "decoder.onnx")
-	sttCfg.Joiner = filepath.Join(sttDir, "joiner.onnx")
-	sttCfg.Tokens = filepath.Join(sttDir, "tokens.txt")
+	sttCfg.Encoder = sttFiles["encoder.onnx"]
+	sttCfg.Decoder = sttFiles["decoder.onnx"]
+	sttCfg.Joiner = sttFiles["joiner.onnx"]
+	sttCfg.Tokens = sttFiles["tokens.txt"]
 	sttCfg.VADModel = vadPath
 	sttCfg.NumThreads = cfg.Threads
 	sttCfg.VADThreshold = cfg.VADThreshold
