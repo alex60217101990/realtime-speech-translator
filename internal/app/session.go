@@ -838,6 +838,11 @@ type Stats struct {
 	TMHits    uint64
 	TMMisses  uint64
 	TMHitRate float64
+
+	// MTEnabled is true when the session got a real translation
+	// engine (not mt.Disabled). UI uses it to flip the header
+	// MT label to "off" when the binary was built without -tags mt.
+	MTEnabled bool
 }
 
 // Stats returns a point-in-time snapshot for the UI status line.
@@ -864,6 +869,8 @@ func (s *Session) Stats() Stats {
 	st.MTLast = time.Duration(s.mtLastNs.Load())
 	st.TTSLast = time.Duration(s.ttsLastNs.Load())
 	st.MicMutedDropped = s.micDropped.Load()
+	_, isDisabled := s.mt.(mt.Disabled)
+	st.MTEnabled = s.mt != nil && !isDisabled
 	return st
 }
 

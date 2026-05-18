@@ -925,6 +925,15 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 			return
 		case <-statusTick.C:
 			st := s.Stats()
+			// Reflect real MT availability in the header — the
+			// saved cfg.MTBackend is "m2m100" but the engine may
+			// have fallen back to Disabled when the binary was
+			// built without -tags mt.
+			if !st.MTEnabled && cfg.MTBackend != "off" {
+				headerCfg := *cfg
+				headerCfg.MTBackend = cfg.MTBackend + " (off · build -tags mt)"
+				fyne.Do(func() { refreshHeader(ctl, headerCfg) })
+			}
 			// Mix in TM cache stats — cmd owns the cache pointer.
 			if cache != nil {
 				cs := cache.Stats()
