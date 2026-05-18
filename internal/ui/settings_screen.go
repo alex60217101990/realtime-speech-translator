@@ -44,34 +44,24 @@ func SettingsScreen(w fyne.Window, cur config.Settings, cb SettingsCallbacks) fy
 	dstEntry.SetPlaceHolder("en / ru / es / ...")
 	form.Append("Target language", dstEntry)
 
-	sttOptions := cb.AvailableSTTModels
-	if len(sttOptions) == 0 {
-		// Surface the current value even if the directory listing is
-		// empty, so users can see what is saved and the field stays
-		// editable.
-		sttOptions = []string{cur.STTModel}
-	}
+	sttOptions := mergeOptions("auto", cur.STTModel, cb.AvailableSTTModels)
 	sttSel := widget.NewSelect(sttOptions, nil)
-	sttSel.SetSelected(cur.STTModel)
-	form.Append("STT model (streaming)", sttSel)
+	sttSel.SetSelected(firstNonEmpty(cur.STTModel, "auto"))
+	form.Append("STT model", sttSel)
 
-	mtSel := widget.NewSelect(
-		[]string{
-			"small100 (realtime ★ — one model, 100 languages)",
-			"opusmt   (realtime ★ — per-pair, fastest)",
-			"off      (passthrough — no translation)",
-		},
-		nil,
-	)
+	mtOptions := []string{
+		"m2m100   (balanced — one model, 100 languages)",
+		"small100 (realtime ★ — distilled m2m100)",
+		"opusmt   (realtime ★ — per-pair, fastest)",
+		"off      (passthrough — no translation)",
+	}
+	mtSel := widget.NewSelect(mtOptions, nil)
 	mtSel.SetSelected(decorateMT(cur.MTBackend))
 	form.Append("MT backend", mtSel)
 
-	ttsOptions := cb.AvailableTTSVoices
-	if len(ttsOptions) == 0 {
-		ttsOptions = []string{cur.TTSVoice}
-	}
+	ttsOptions := mergeOptions("", cur.TTSVoice, cb.AvailableTTSVoices)
 	ttsSel := widget.NewSelect(ttsOptions, nil)
-	ttsSel.SetSelected(cur.TTSVoice)
+	ttsSel.SetSelected(firstNonEmpty(cur.TTSVoice, ttsOptions[0]))
 	form.Append("TTS voice (Piper)", ttsSel)
 
 	threadsEntry := widget.NewEntry()
@@ -163,7 +153,8 @@ func undecorate(s string) string {
 // no longer exists.
 func decorateMT(name string) string {
 	for _, opt := range []string{
-		"small100 (realtime ★ — one model, 100 languages)",
+		"m2m100   (balanced — one model, 100 languages)",
+		"small100 (realtime ★ — distilled m2m100)",
 		"opusmt   (realtime ★ — per-pair, fastest)",
 		"off      (passthrough — no translation)",
 	} {
@@ -172,4 +163,43 @@ func decorateMT(name string) string {
 		}
 	}
 	return name
+}
+
+// mergeOptions guarantees the Select has at least the sentinel
+// option, the current saved value (so the user sees what's
+// persisted), and every installed name. Order: sentinel first,
+// then installed names alphabetically, then the current value
+// last if it's not already in the list. The returned slice is
+// never empty — that's what causes the NewPopUpMenu nil-deref
+// crash inside Fyne 2.7.
+func mergeOptions(sentinel, current string, installed []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if sentinel != "" {
+		add(sentinel)
+	}
+	for _, n := range installed {
+		add(n)
+	}
+	add(current)
+	if len(out) == 0 {
+		// Last-resort placeholder so widget.Select always has
+		// something to show — empty options crash Fyne 2.7.
+		out = []string{"(none installed)"}
+	}
+	return out
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }

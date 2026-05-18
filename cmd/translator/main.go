@@ -631,8 +631,19 @@ func buildMT(cfg config.Settings) (mt.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Resolve the requested backend to one that actually has its
+	// files on disk. Avoids "model.bin missing" warnings when the
+	// user installed (say) m2m100 but the config still points at
+	// small100 from a previous session.
+	backend := resolveMTBackend(cfg.MTBackend, sm, m2m, root)
+	if backend != cfg.MTBackend {
+		slog.Info("mt backend auto-resolved",
+			"requested", cfg.MTBackend, "using", backend)
+	}
+
 	return mt.Build(mt.FactoryConfig{
-		Backend:          cfg.MTBackend,
+		Backend:          backend,
 		M2M100ModelDir:   m2m,
 		M2M100SPModel:    filepath.Join(m2m, "sentencepiece.bpe.model"),
 		SMaLL100ModelDir: sm,
@@ -640,6 +651,44 @@ func buildMT(cfg config.Settings) (mt.Engine, error) {
 		OPUSMTRoot:       root,
 		Threads:          cfg.Threads,
 	})
+}
+
+// resolveMTBackend falls back to whatever MT model is actually
+// usable on disk when the requested backend has no files. Walks
+// the priority list in order; "off" stops the search (the user
+// explicitly disabled MT).
+func resolveMTBackend(requested, smDir, m2mDir, opusRoot string) string {
+	want := strings.ToLower(strings.TrimSpace(requested))
+	if want == "off" {
+		return "off"
+	}
+	usable := func(b string) bool {
+		switch b {
+		case "m2m100":
+			return fileExists(filepath.Join(m2mDir, "model.bin"))
+		case "small100":
+			return fileExists(filepath.Join(smDir, "model.bin"))
+		case "opusmt":
+			// At least one pair installed.
+			entries, _ := os.ReadDir(opusRoot)
+			for _, e := range entries {
+				if e.IsDir() {
+					return true
+				}
+			}
+			return false
+		}
+		return false
+	}
+	if want != "" && want != "auto" && usable(want) {
+		return want
+	}
+	for _, b := range []string{"m2m100", "small100", "opusmt"} {
+		if usable(b) {
+			return b
+		}
+	}
+	return "off"
 }
 
 // buildMTWithCache wraps the resolved MT engine in a disk-backed
