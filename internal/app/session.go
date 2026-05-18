@@ -39,9 +39,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/capture"
 	"github.com/alex60217101990/realtime-speech-translator/internal/audio/playback"
@@ -134,6 +136,10 @@ type Session struct {
 	mtDrops  atomic.Uint64
 	ttsDrops atomic.Uint64
 	running  atomic.Bool
+
+	// Rolling last-N timings, stored as ns. Loaded by the UI poll.
+	mtLastNs  atomic.Uint64
+	ttsLastNs atomic.Uint64
 }
 
 // New constructs the Session, opens the audio devices and loads the
@@ -322,7 +328,9 @@ func (s *Session) runMT(ctx context.Context) {
 			if src == "" {
 				continue
 			}
+			start := time.Now()
 			tgt, err := s.mt.Translate(src, s.cfg.Source, s.cfg.Target)
+			s.mtLastNs.Store(uint64(time.Since(start).Nanoseconds()))
 			if err != nil {
 				s.emit(ctx, ErrorEv{Err: fmt.Errorf("mt: %w", err)})
 				continue
@@ -362,10 +370,12 @@ func (s *Session) runTTS(ctx context.Context) {
 				continue
 			}
 			s.emit(ctx, Speaking{Active: true})
+			start := time.Now()
 			chunks := s.tts.Speak(ctx, text)
 			for chunk := range chunks {
 				s.pumpToPlayback(ctx, chunk.Samples)
 			}
+			s.ttsLastNs.Store(uint64(time.Since(start).Nanoseconds()))
 			s.emit(ctx, Speaking{Active: false})
 		}
 	}
@@ -452,30 +462,55 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// Stats is a snapshot of operational counters.
+// Stats is a snapshot of operational counters surfaced to the UI.
 type Stats struct {
-	STTDropped      uint64
-	MTDropped       uint64
-	TTSDropped      uint64
+	// Lifecycle.
+	Running bool
+
+	// Audio path.
+	Captured        time.Duration
+	MicRMS          float32 // 0..1
+	MicPct          int     // 100*MicRMS, rounded
+	VADActivePct    int     // 100*VADActiveRatio()
 	CaptureDropped  uint64
 	PlaybackUnderrn uint64
+
+	// STT.
+	Utterances uint64
+	STTDropped uint64
+
+	// Per-stage last-utterance latency.
+	MTLast  time.Duration
+	TTSLast time.Duration
+
+	// Queue pressure.
+	MTDropped  uint64
+	TTSDropped uint64
 }
 
-// Stats returns a point-in-time snapshot of the lag-relevant
-// counters. Useful for the UI status line and for the bench command.
+// Stats returns a point-in-time snapshot for the UI status line.
 func (s *Session) Stats() Stats {
 	var st Stats
+	st.Running = s.running.Load()
+	if s.cap != nil {
+		st.Captured = s.cap.Captured()
+		rms := s.cap.MicRMS()
+		st.MicRMS = rms
+		st.MicPct = int(math.Round(float64(rms) * 100))
+		st.CaptureDropped = s.cap.Dropped()
+	}
 	if s.stt != nil {
 		st.STTDropped = s.stt.Dropped()
-	}
-	st.MTDropped = s.mtDrops.Load()
-	st.TTSDropped = s.ttsDrops.Load()
-	if s.cap != nil {
-		st.CaptureDropped = s.cap.Dropped()
+		st.Utterances = s.stt.Utterances()
+		st.VADActivePct = int(math.Round(float64(s.stt.VADActiveRatio()) * 100))
 	}
 	if s.pb != nil {
 		st.PlaybackUnderrn = s.pb.Underruns()
 	}
+	st.MTDropped = s.mtDrops.Load()
+	st.TTSDropped = s.ttsDrops.Load()
+	st.MTLast = time.Duration(s.mtLastNs.Load())
+	st.TTSLast = time.Duration(s.ttsLastNs.Load())
 	return st
 }
 

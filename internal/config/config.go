@@ -68,9 +68,9 @@ func Default() Settings {
 	return Settings{
 		SourceLang:   "auto",
 		TargetLang:   "en",
-		STTModel:     "zipformer-streaming-multi-en-zh",
+		STTModel:     "zipformer-streaming-en",
 		MTBackend:    "small100",
-		TTSVoice:     "piper-en-amy-medium",
+		TTSVoice:     "piper-en-amy-low",
 		Threads:      0,
 		VADThreshold: 0.5,
 		OutputDevice: "",

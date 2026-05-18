@@ -37,6 +37,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
@@ -126,9 +127,25 @@ type Engine struct {
 	audioCh chan []float32
 	eventCh chan Event
 
-	dropped atomic.Uint64
+	dropped     atomic.Uint64
+	utterances  atomic.Uint64
+	vadActiveNs atomic.Uint64 // ns inside VAD speech, monotonic
+	totalNs     atomic.Uint64 // ns of audio processed, monotonic
 
 	closeOnce sync.Once
+}
+
+// Utterances returns the count of finalised utterances since Run.
+func (e *Engine) Utterances() uint64 { return e.utterances.Load() }
+
+// VADActiveRatio returns the fraction of processed audio time during
+// which Silero reported speech ([0,1]).
+func (e *Engine) VADActiveRatio() float32 {
+	total := e.totalNs.Load()
+	if total == 0 {
+		return 0
+	}
+	return float32(float64(e.vadActiveNs.Load()) / float64(total))
 }
 
 // New constructs an Engine and loads the underlying ONNX models. The
@@ -272,6 +289,13 @@ func (e *Engine) Run(ctx context.Context) {
 			e.vad.AcceptWaveform(samples)
 			speech := e.vad.IsSpeech()
 
+			// Track total audio + VAD-speech time for status UI.
+			chunkNs := uint64(int64(len(samples)) * int64(time.Second) / int64(e.cfg.SampleRate))
+			e.totalNs.Add(chunkNs)
+			if speech {
+				e.vadActiveNs.Add(chunkNs)
+			}
+
 			if !speech && !inSegment {
 				// Pure silence or background noise — skip
 				// ASR entirely to save CPU and avoid
@@ -295,6 +319,7 @@ func (e *Engine) Run(ctx context.Context) {
 			if e.rec.IsEndpoint(stream) {
 				if lastPartial != "" {
 					emit(Final{Text: lastPartial})
+					e.utterances.Add(1)
 				}
 				e.rec.Reset(stream)
 				lastPartial = ""

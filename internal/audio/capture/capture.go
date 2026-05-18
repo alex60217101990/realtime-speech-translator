@@ -19,8 +19,10 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gen2brain/malgo"
 
@@ -55,8 +57,10 @@ type Capture struct {
 	push PushFunc
 	pool sync.Pool
 
-	dropped atomic.Uint64
-	started atomic.Bool
+	dropped   atomic.Uint64
+	started   atomic.Bool
+	samples   atomic.Uint64 // monotonically increasing sample count
+	rmsBits   atomic.Uint32 // last RMS as float32 bits (0..1)
 }
 
 // New constructs a capture pipeline bound to the default input
@@ -134,6 +138,17 @@ func (c *Capture) onFrames(_, in []byte, n uint32) {
 	src := unsafeBytesToInt16(in[:required])
 	sample.Int16ToFloat32(src, buf)
 
+	// Cheap RMS over the chunk — used by the voice viz and the
+	// status line. Runs after the SIMD conversion so we operate on
+	// already-normalised float32 in [-1, 1].
+	var sumSq float64
+	for _, v := range buf {
+		sumSq += float64(v) * float64(v)
+	}
+	rms := float32(math.Sqrt(sumSq / float64(len(buf))))
+	c.rmsBits.Store(math.Float32bits(rms))
+	c.samples.Add(uint64(nSamples))
+
 	c.push(buf)
 
 	*bufPtr = buf[:0]
@@ -184,3 +199,18 @@ func (c *Capture) Close() error {
 // because the input byte buffer was shorter than the declared sample
 // count — a host driver bug rather than a backpressure signal.
 func (c *Capture) Dropped() uint64 { return c.dropped.Load() }
+
+// Captured returns total mic audio duration ingested since Start.
+func (c *Capture) Captured() time.Duration {
+	if c.cfg.SampleRate == 0 {
+		return 0
+	}
+	n := c.samples.Load()
+	return time.Duration(float64(n) / float64(c.cfg.SampleRate) * float64(time.Second))
+}
+
+// MicRMS returns the last RMS amplitude in [0, 1]. Updated once per
+// audio callback (~10–50 ms).
+func (c *Capture) MicRMS() float32 {
+	return math.Float32frombits(c.rmsBits.Load())
+}

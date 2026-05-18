@@ -128,17 +128,34 @@ func main() {
 				}
 			},
 		})
-		if len(tabs.Items) > 1 {
-			tabs.Items[1].Content = settings
-			tabs.Refresh()
-		} else {
-			tabs.Append(container.NewTabItem("Settings", settings))
+		// Find an existing Settings tab and replace its content;
+		// otherwise append. Lookup-by-name is safer than indexing
+		// because the tab order may evolve.
+		for _, item := range tabs.Items {
+			if item.Text == "Settings" {
+				item.Content = settings
+				tabs.Refresh()
+				return
+			}
 		}
+		tabs.Append(container.NewTabItem("Settings", settings))
 	}
 
 	modelsTab := ui.ModelsScreen(w, models.DefaultCatalog(), ui.ModelsCallbacks{
 		OnInstalled: func(e models.Entry) {
 			slog.Info("model installed", "kind", e.Kind, "name", e.Name)
+			// Auto-point the config at the freshly installed
+			// artefact so the user does not have to open Settings
+			// just to make a download usable. VAD is singleton
+			// (silero_vad.onnx); STT and TTS are name-keyed.
+			switch e.Kind {
+			case models.KindSTT:
+				cfg.STTModel = e.Name
+				_ = config.Save(cfg)
+			case models.KindTTS:
+				cfg.TTSVoice = e.Name
+				_ = config.Save(cfg)
+			}
 			rebuildSettings()
 			if tryStart != nil {
 				tryStart()
@@ -146,9 +163,12 @@ func main() {
 		},
 	})
 
-	tabs.Append(container.NewTabItem("Live", live))
-	rebuildSettings()
+	// Order matches the previous UX: Main first, Models in the
+	// middle (because that is where the user goes from a fresh
+	// install), Settings last.
+	tabs.Append(container.NewTabItem("Main", live))
 	tabs.Append(container.NewTabItem("Models", modelsTab))
+	rebuildSettings()
 
 	w.SetContent(tabs)
 
@@ -167,16 +187,16 @@ func main() {
 			if errors.Is(err, errModelsMissing) {
 				slog.Warn("session not started; install models via the Models tab", "err", err)
 				fyne.Do(func() {
-					ctl := liveCtl
-					ctl.partial.SetText("")
-					ctl.translation.SetText("Install STT + VAD models in the Models tab to start.")
-					ctl.status.SetText(fmt.Sprintf("v%s · waiting for models", version))
+					liveCtl.currentStatus = "waiting for models"
+					liveCtl.partial.SetText("Install STT + VAD models in the Models tab to start.")
+					refreshStatusBlock(liveCtl, rstapp.Stats{})
 				})
 				return
 			}
 			slog.Error("build session", "err", err)
 			fyne.Do(func() {
-				liveCtl.translation.SetText("Session error: " + err.Error())
+				liveCtl.currentStatus = "error"
+				liveCtl.partial.SetText("Session error: " + err.Error())
 			})
 			return
 		}
@@ -187,16 +207,26 @@ func main() {
 			slog.Error("session start", "err", err)
 			_ = session.Close()
 			fyne.Do(func() {
-				liveCtl.translation.SetText("Start failed: " + err.Error())
+				liveCtl.currentStatus = "start failed"
+				liveCtl.partial.SetText("Start failed: " + err.Error())
 			})
 			return
 		}
 		state.session = session
 		state.nativeTTS = nativeTTS
 		fyne.Do(func() {
-			liveCtl.translation.SetText("")
+			liveCtl.currentStatus = "running"
+			liveCtl.partial.SetText("")
+			refreshHeader(liveCtl, cfg)
 		})
-		go pumpEvents(ctx, session, liveCtl, nativeTTS)
+		go pumpEvents(ctx, session, liveCtl, nativeTTS, &cfg)
+	}
+
+	ctl := liveCtl
+	ctl.startBtn.OnTapped = func() {
+		ctl.currentStatus = "starting"
+		ctl.partial.SetText("")
+		tryStart()
 	}
 
 	tryStart()
@@ -342,56 +372,156 @@ func buildMT(cfg config.Settings) (mt.Engine, error) {
 
 // liveControls bundles the widgets the event pump updates.
 type liveControls struct {
-	partial     *widget.Label
-	translation *widget.Label
-	history     *widget.List
-	historyData []string
-	status      *widget.Label
-	speakingDot *widget.Label
+	header        *widget.Label
+	statusLine    *widget.Label
+	statsLine     *widget.Label
+	lagLine       *widget.Label
+	partial       *widget.Label
+	speakingDot   *widget.Label
+	viz           *ui.VoiceViz
+	startBtn      *widget.Button
+	transcript    *widget.List
+	transcriptD   []string
+	translation   *widget.List
+	translationD  []string
+	currentStatus string
 }
 
 func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
 	ctl := &liveControls{
-		partial:     widget.NewLabel(""),
-		translation: widget.NewLabel(""),
-		status:      widget.NewLabel(statusLine(cfg, rstapp.Stats{})),
-		speakingDot: widget.NewLabel(" "),
+		header:        widget.NewLabel(""),
+		statusLine:    widget.NewLabel(""),
+		statsLine:     widget.NewLabel(""),
+		lagLine:       widget.NewLabel(""),
+		partial:       widget.NewLabel(""),
+		speakingDot:   widget.NewLabel(" "),
+		viz:           ui.NewVoiceViz(),
+		currentStatus: "idle",
 	}
 	ctl.partial.Wrapping = fyne.TextWrapWord
-	ctl.translation.Wrapping = fyne.TextWrapWord
-	ctl.translation.TextStyle = fyne.TextStyle{Bold: true}
 
-	ctl.history = widget.NewList(
-		func() int { return len(ctl.historyData) },
-		func() fyne.CanvasObject {
-			l := widget.NewLabel("")
-			l.Wrapping = fyne.TextWrapWord
-			return l
-		},
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText(ctl.historyData[i])
-		},
+	mkList := func(data *[]string) *widget.List {
+		return widget.NewList(
+			func() int { return len(*data) },
+			func() fyne.CanvasObject {
+				l := widget.NewLabel("")
+				l.Wrapping = fyne.TextWrapWord
+				return l
+			},
+			func(i widget.ListItemID, o fyne.CanvasObject) {
+				o.(*widget.Label).SetText((*data)[i])
+			},
+		)
+	}
+	ctl.transcript = mkList(&ctl.transcriptD)
+	ctl.translation = mkList(&ctl.translationD)
+
+	refreshHeader(ctl, cfg)
+	refreshStatusBlock(ctl, rstapp.Stats{})
+
+	ctl.startBtn = widget.NewButton("Start", nil)
+
+	top := container.NewVBox(
+		ctl.header,
+		ctl.statusLine,
+		ctl.statsLine,
+		ctl.lagLine,
 	)
 
-	header := container.NewHBox(
-		widget.NewLabelWithStyle(cfg.SourceLang+" → "+cfg.TargetLang,
-			fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		ctl.speakingDot,
+	center := container.NewBorder(nil, nil, nil, ctl.speakingDot, ctl.viz)
+
+	buttons := container.NewGridWithColumns(1, ctl.startBtn)
+
+	twoCol := container.NewGridWithColumns(2,
+		container.NewBorder(
+			widget.NewLabelWithStyle("Transcript", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+			nil, nil, nil,
+			ctl.transcript,
+		),
+		container.NewBorder(
+			widget.NewLabelWithStyle("Translation", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+			nil, nil, nil,
+			ctl.translation,
+		),
 	)
-	body := container.NewVBox(
-		widget.NewLabelWithStyle("Heard", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
-		ctl.partial,
-		widget.NewLabelWithStyle("Translation", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
-		ctl.translation,
-	)
+
 	root := container.NewBorder(
-		header,
-		ctl.status,
+		container.NewVBox(top, center),
+		container.NewVBox(buttons, ctl.partial, twoCol),
 		nil, nil,
-		container.NewVSplit(body, ctl.history),
+		nil,
 	)
 	return root, ctl
+}
+
+// refreshHeader rewrites the header line that summarises which
+// engines / devices the current session is bound to. Called on boot
+// and every time cfg changes.
+func refreshHeader(ctl *liveControls, cfg config.Settings) {
+	parts := []string{
+		"Source: " + nonEmpty(cfg.SourceLang, "auto"),
+		"Target: " + nonEmpty(cfg.TargetLang, "—"),
+		"MT: " + nonEmpty(cfg.MTBackend, "off"),
+		"TTS: " + ttsLabel(cfg),
+		"VMic: " + nonEmpty(cfg.OutputDevice, "system default"),
+	}
+	ctl.header.SetText(strings.Join(parts, "    "))
+}
+
+func ttsLabel(cfg config.Settings) string {
+	if !cfg.TTSEnabled {
+		return "off"
+	}
+	if cfg.TTSVoice == "" {
+		return "piper"
+	}
+	return "piper · " + cfg.TTSVoice
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
+// refreshStatusBlock updates the three status rows that mirror the
+// pre-rewrite UX: status / capture / mic / VAD / utts, then per-stage
+// timings, then a lag breakdown.
+func refreshStatusBlock(ctl *liveControls, st rstapp.Stats) {
+	status := ctl.currentStatus
+	if !st.Running && status == "" {
+		status = "idle"
+	}
+	if st.Running && status == "" {
+		status = "running"
+	}
+	ctl.statusLine.SetText(fmt.Sprintf(
+		"Status: %s   Captured: %.1fs   Mic: %d%%   VAD active: %d%%   Utts: %d (drop %d)",
+		status,
+		st.Captured.Seconds(),
+		st.MicPct,
+		st.VADActivePct,
+		st.Utterances,
+		st.STTDropped,
+	))
+	ctl.statsLine.SetText(fmt.Sprintf(
+		"MT: %s   TTS: %s   Drops: mt=%d tts=%d cap=%d   Underruns: %d",
+		fmtMs(st.MTLast), fmtMs(st.TTSLast),
+		st.MTDropped, st.TTSDropped, st.CaptureDropped,
+		st.PlaybackUnderrn,
+	))
+	ctl.lagLine.SetText(fmt.Sprintf(
+		"v%s   prev_mt: %s   prev_tts: %s",
+		version, fmtMs(st.MTLast), fmtMs(st.TTSLast),
+	))
+}
+
+func fmtMs(d time.Duration) string {
+	if d <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.3fs", d.Seconds())
 }
 
 // pumpEvents drains the Session event channel onto the UI controls.
@@ -401,8 +531,8 @@ func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
 // When nativeTTS is non-nil the session itself runs with TTS off and
 // every Translation event is forwarded to the native synthesizer in
 // a fire-and-forget goroutine.
-func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativeTTS *native.Engine) {
-	statusTick := time.NewTicker(750 * time.Millisecond)
+func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativeTTS *native.Engine, cfg *config.Settings) {
+	statusTick := time.NewTicker(500 * time.Millisecond)
 	defer statusTick.Stop()
 
 	for {
@@ -411,8 +541,10 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 			return
 		case <-statusTick.C:
 			st := s.Stats()
-			text := statusLine(config.Settings{}, st)
-			fyne.Do(func() { ctl.status.SetText(text) })
+			fyne.Do(func() {
+				refreshStatusBlock(ctl, st)
+				ctl.viz.SetLevel(st.MicRMS*4, st.VADActivePct > 0)
+			})
 
 		case ev, ok := <-s.Events():
 			if !ok {
@@ -424,24 +556,21 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 				fyne.Do(func() { ctl.partial.SetText(txt) })
 
 			case rstapp.Final:
-				txt := "▸ " + e.Text
+				line := fmt.Sprintf("[%s] %s", nonEmpty(cfg.SourceLang, "src"), e.Text)
 				fyne.Do(func() {
 					ctl.partial.SetText("")
-					appendHistory(ctl, txt)
+					appendTranscript(ctl, line)
 				})
 
 			case rstapp.Translation:
-				tgt := e.Target
-				fyne.Do(func() {
-					ctl.translation.SetText(tgt)
-					appendHistory(ctl, "→ "+tgt)
-				})
-				if nativeTTS != nil && tgt != "" {
+				line := fmt.Sprintf("[%s] %s", nonEmpty(cfg.TargetLang, "tgt"), e.Target)
+				fyne.Do(func() { appendTranslation(ctl, line) })
+				if nativeTTS != nil && e.Target != "" {
 					go func(text string) {
 						if err := nativeTTS.Speak(ctx, text); err != nil {
 							slog.Warn("native tts speak", "err", err)
 						}
-					}(tgt)
+					}(e.Target)
 				}
 
 			case rstapp.Speaking:
@@ -454,26 +583,31 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 			case rstapp.ErrorEv:
 				if e.Err != nil && !errors.Is(e.Err, context.Canceled) {
 					msg := "! " + e.Err.Error()
-					fyne.Do(func() { appendHistory(ctl, msg) })
+					fyne.Do(func() { appendTranscript(ctl, msg) })
 				}
 			}
 		}
 	}
 }
 
-func appendHistory(ctl *liveControls, line string) {
-	ctl.historyData = append(ctl.historyData, line)
-	const cap = 64
-	if len(ctl.historyData) > cap {
-		ctl.historyData = ctl.historyData[len(ctl.historyData)-cap:]
+const historyCap = 128
+
+func appendTranscript(ctl *liveControls, line string) {
+	ctl.transcriptD = append(ctl.transcriptD, line)
+	if len(ctl.transcriptD) > historyCap {
+		ctl.transcriptD = ctl.transcriptD[len(ctl.transcriptD)-historyCap:]
 	}
-	ctl.history.Refresh()
-	ctl.history.ScrollToBottom()
+	ctl.transcript.Refresh()
+	ctl.transcript.ScrollToBottom()
 }
 
-func statusLine(_ config.Settings, st rstapp.Stats) string {
-	return fmt.Sprintf("v%s · drops stt=%d mt=%d tts=%d cap=%d · underruns=%d",
-		version, st.STTDropped, st.MTDropped, st.TTSDropped, st.CaptureDropped, st.PlaybackUnderrn)
+func appendTranslation(ctl *liveControls, line string) {
+	ctl.translationD = append(ctl.translationD, line)
+	if len(ctl.translationD) > historyCap {
+		ctl.translationD = ctl.translationD[len(ctl.translationD)-historyCap:]
+	}
+	ctl.translation.Refresh()
+	ctl.translation.ScrollToBottom()
 }
 
 // modelsSubdir resolves <data>/models/<kind>/ for UI directory
