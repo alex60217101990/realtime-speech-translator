@@ -5,17 +5,17 @@
 // Layout (XDG on Linux, Library/Application Support on macOS, AppData
 // on Windows):
 //
-//   data/
-//   ├── models/
-//   │   ├── whisper/<name>.bin
-//   │   ├── mt/<name>/{model.bin, config.json, sentencepiece.bpe.model}
-//   │   └── tts/<name>.{onnx,onnx.json}
-//   └── config.yaml
+//	data/
+//	├── models/
+//	│   ├── stt/<name>/{encoder.onnx, decoder.onnx, joiner.onnx, tokens.txt}
+//	│   ├── vad/silero_vad.onnx
+//	│   ├── mt/<name>/{model.bin, config.json, sentencepiece.bpe.model}
+//	│   └── tts/<name>/{model.onnx, tokens.txt, espeak-ng-data/}
+//	└── config.yaml
 package paths
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -86,22 +86,38 @@ func Models() (string, error) {
 	return p, nil
 }
 
-// Whisper returns the local path where a named whisper model lives.
-// The directory is created on demand; the file may or may not exist.
-func Whisper(name string) (string, error) {
+// STTDir returns the local directory for a named streaming ASR model
+// (sherpa-onnx online transducer/paraformer export). Created on demand.
+func STTDir(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("paths: empty STT name")
+	}
 	m, err := Models()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(m, "whisper")
+	dir := filepath.Join(m, "stt", name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, fmt.Sprintf("ggml-%s.bin", name)), nil
+	return dir, nil
+}
+
+// VADModel returns the path of the Silero VAD onnx file.
+func VADModel() (string, error) {
+	m, err := Models()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(m, "vad")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "silero_vad.onnx"), nil
 }
 
 // MTDir returns the local directory for a named MT model
-// (CTranslate2 export). It is created on demand.
+// (CTranslate2 export). Created on demand.
 func MTDir(name string) (string, error) {
 	if name == "" {
 		return "", errors.New("paths: empty MT name")
@@ -145,39 +161,31 @@ func OPUSMTRoot() (string, error) {
 	return filepath.Join(m, "mt", "opusmt"), nil
 }
 
+// TTSDir returns the local directory for a named TTS voice
+// (sherpa-onnx Piper export: model.onnx + tokens.txt + espeak-ng-data/).
+func TTSDir(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("paths: empty TTS name")
+	}
+	m, err := Models()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(m, "tts", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // TranslationMemory returns the path of the persistent translation
-// memory JSON file. The parent dir is the application data root
-// (created by callers via os.MkdirAll on first save).
+// memory JSON file. Parent dir is the application data root.
 func TranslationMemory() (string, error) {
 	d, err := Data()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(d, "translation_memory.json"), nil
-}
-
-// TTSVoice returns the local file path for a Piper voice .onnx; the
-// sibling .onnx.json is at TTSVoiceJSON(name). The directory is created
-// on demand; the files may or may not exist.
-func TTSVoice(name string) (string, error) {
-	m, err := Models()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(m, "tts")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, name+".onnx"), nil
-}
-
-// TTSVoiceJSON returns the sidecar JSON path next to TTSVoice(name).
-func TTSVoiceJSON(name string) (string, error) {
-	p, err := TTSVoice(name)
-	if err != nil {
-		return "", err
-	}
-	return p + ".json", nil
 }
 
 // Exists is a small convenience that hides the os.Stat dance.
@@ -187,7 +195,7 @@ func Exists(path string) bool {
 }
 
 // FileSize returns the size in bytes, or zero if the file does not
-// exist or stat fails. Convenience for the Models Manager UI.
+// exist or stat fails.
 func FileSize(path string) int64 {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
