@@ -40,6 +40,7 @@ import (
 	rstapp "github.com/alex60217101990/realtime-speech-translator/internal/app"
 	"github.com/alex60217101990/realtime-speech-translator/internal/config"
 	"github.com/alex60217101990/realtime-speech-translator/internal/logging"
+	"github.com/alex60217101990/realtime-speech-translator/internal/models"
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
@@ -102,18 +103,36 @@ func main() {
 
 	live, liveCtl := buildLiveTab(cfg)
 
-	settings := ui.SettingsScreen(w, cfg, ui.SettingsCallbacks{
-		AvailableSTTModels: listDirs(modelsSubdir("stt")),
-		AvailableTTSVoices: listDirs(modelsSubdir("tts")),
-		OnSave: func(s config.Settings) {
-			slog.Info("settings saved", "stt", s.STTModel, "mt", s.MTBackend, "tts", s.TTSVoice)
+	tabs := container.NewAppTabs()
+	rebuildSettings := func() {
+		settings := ui.SettingsScreen(w, cfg, ui.SettingsCallbacks{
+			AvailableSTTModels: listDirs(modelsSubdir("stt")),
+			AvailableTTSVoices: listDirs(modelsSubdir("tts")),
+			OnSave: func(s config.Settings) {
+				slog.Info("settings saved", "stt", s.STTModel, "mt", s.MTBackend, "tts", s.TTSVoice)
+				cfg = s
+			},
+		})
+		// Replace the Settings tab in place so dropdowns refresh
+		// after a model install completes.
+		if len(tabs.Items) > 1 {
+			tabs.Items[1].Content = settings
+			tabs.Refresh()
+		} else {
+			tabs.Append(container.NewTabItem("Settings", settings))
+		}
+	}
+
+	modelsTab := ui.ModelsScreen(w, models.DefaultCatalog(), ui.ModelsCallbacks{
+		OnInstalled: func(e models.Entry) {
+			slog.Info("model installed", "kind", e.Kind, "name", e.Name)
+			rebuildSettings()
 		},
 	})
 
-	tabs := container.NewAppTabs(
-		container.NewTabItem("Live", live),
-		container.NewTabItem("Settings", settings),
-	)
+	tabs.Append(container.NewTabItem("Live", live))
+	rebuildSettings()
+	tabs.Append(container.NewTabItem("Models", modelsTab))
 
 	w.SetContent(tabs)
 
