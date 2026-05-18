@@ -1,77 +1,150 @@
 package uiebt
 
 import (
+	"image"
 	"image/color"
+	"sync"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
-// Window size matching the reference mock. Layout below is a
-// fixed-grid for now (header / left pane / sphere / right pane /
-// bottom bar). A responsive layout will replace this once we have
-// real text measurement helpers and the sphere shader is in place.
+// Window size matching the reference mock. Layout is responsive
+// from here on; this only sets the initial window dimension.
 const (
 	WindowWidth  = 1280
 	WindowHeight = 800
 )
 
-// App is the top-level Ebiten Game. The first revision is
-// deliberately minimal — it paints the dark vertical gradient
-// background and the window chrome so we can iterate on widgets
-// without scope creep. Subsequent commits attach panes, sphere,
-// bindings to internal/app.Session, etc.
+// sessionStatus enumerates the values the header pill displays.
+// Values match the strings emitted by the cmd layer when it owns a
+// Session; the UI is happy to render any of them.
+type sessionStatus int
+
+const (
+	statusRunning sessionStatus = iota
+	statusWaiting
+	statusStopped
+	statusError
+)
+
+// App is the top-level Ebiten Game. State is kept under a single
+// mutex because the bindings (set via the AppBindings struct) push
+// new transcript / translation lines from a background goroutine.
 type App struct {
-	theme Theme
+	theme  Theme
+	fonts  Fonts
+	bg     *backgroundCache
 
-	// frame is the offscreen image we draw into every tick. Resized
-	// in Layout when the window dims change.
-	frame *ebiten.Image
+	mu          sync.RWMutex
+	status      sessionStatus
+	transcript  []Card
+	translation []Card
+	sourceLang  string // "Русский"
+	targetLang  string // "English"
+	sourceCode  string // "ru"
+	targetCode  string // "en"
+	hint        string // bottom-bar microcopy
+}
 
-	bgWidth, bgHeight int
-	bgImage           *ebiten.Image
+// backgroundCache holds the per-size gradient image so we only
+// repaint it on resize, not every frame.
+type backgroundCache struct {
+	w, h  int
+	image *ebiten.Image
 }
 
 // NewApp constructs a default-theme App. Call Run to enter the
 // Ebiten loop.
 func NewApp() *App {
-	return &App{theme: DefaultTheme()}
+	return &App{
+		theme:      DefaultTheme(),
+		fonts:      MustLoadFonts(),
+		status:     statusWaiting,
+		sourceLang: "Русский",
+		targetLang: "English",
+		sourceCode: "ru",
+		targetCode: "en",
+		hint:       "Нажмите ⌘ + K для быстрого старта",
+	}
 }
 
-// Update advances logic. We have nothing to tick yet — return nil
-// so the loop runs at the configured TPS.
-func (a *App) Update() error {
-	return nil
+// SetStatus updates the header pill from the binding goroutine.
+func (a *App) SetStatus(s sessionStatus) {
+	a.mu.Lock()
+	a.status = s
+	a.mu.Unlock()
 }
+
+// AppendTranscript pushes one finalised STT line to the left pane.
+func (a *App) AppendTranscript(text, ts string) {
+	a.mu.Lock()
+	a.transcript = append(a.transcript, Card{Text: text, Timestamp: ts, Active: true})
+	// dim the previous active card.
+	if n := len(a.transcript); n >= 2 {
+		a.transcript[n-2].Active = false
+	}
+	a.mu.Unlock()
+}
+
+// AppendTranslation pushes one MT line to the right pane.
+func (a *App) AppendTranslation(text, ts string) {
+	a.mu.Lock()
+	a.translation = append(a.translation, Card{Text: text, Timestamp: ts, Active: true})
+	if n := len(a.translation); n >= 2 {
+		a.translation[n-2].Active = false
+	}
+	a.mu.Unlock()
+}
+
+// SetLanguages updates the pane headers + flag colours.
+func (a *App) SetLanguages(srcCode, srcLabel, tgtCode, tgtLabel string) {
+	a.mu.Lock()
+	a.sourceCode = srcCode
+	a.sourceLang = srcLabel
+	a.targetCode = tgtCode
+	a.targetLang = tgtLabel
+	a.mu.Unlock()
+}
+
+// Update advances logic. Nothing to tick yet.
+func (a *App) Update() error { return nil }
 
 // Draw paints one frame.
 func (a *App) Draw(screen *ebiten.Image) {
-	a.ensureBackground(screen.Bounds().Dx(), screen.Bounds().Dy())
-	screen.DrawImage(a.bgImage, nil)
+	bounds := screen.Bounds()
+	a.ensureBackground(bounds.Dx(), bounds.Dy())
+	screen.DrawImage(a.bg.image, nil)
 
-	// Placeholder content so the empty window is visibly the new
-	// app rather than a black rectangle. Replaced in Stage 2 by
-	// the header + panes.
-	cardW, cardH := 480, 64
-	cx := (screen.Bounds().Dx() - cardW) / 2
-	cy := SpaceXX
-	a.drawCard(screen, cx, cy, cardW, cardH)
-	a.drawCenteredText(screen,
-		cx, cy, cardW, cardH,
-		"Realtime Speech Translator",
-		a.theme.TextPrimary,
-	)
+	a.mu.RLock()
+	transcript := append([]Card(nil), a.transcript...)
+	translation := append([]Card(nil), a.translation...)
+	srcCode, srcLabel := a.sourceCode, a.sourceLang
+	tgtCode, tgtLabel := a.targetCode, a.targetLang
+	a.mu.RUnlock()
+
+	r := LayoutFor(bounds.Dx(), bounds.Dy())
+	a.drawHeader(screen, r.Header)
+	a.drawPane(screen, r.Left, PaneHeader{Flag: srcCode, Label: srcLabel}, transcript)
+	a.drawPane(screen, r.Right, PaneHeader{Flag: tgtCode, Label: tgtLabel}, translation)
+	a.drawCenter(screen, r.Center)
+	a.drawBottom(screen, r.Bottom)
+	a.drawStatus(screen, r.Status)
 }
 
 // Layout reports the logical-pixel dimensions Ebiten should render
-// into. We pin to the mock size; the window manager handles
-// physical → logical scaling.
+// into. We pin to the host's outer dims so resize is honoured.
 func (a *App) Layout(outerWidth, outerHeight int) (int, int) {
-	return WindowWidth, WindowHeight
+	if outerWidth < 800 {
+		outerWidth = 800
+	}
+	if outerHeight < 600 {
+		outerHeight = 600
+	}
+	return outerWidth, outerHeight
 }
 
-// Run sets up the window and enters the Ebiten event loop. Blocks
-// until the user closes the window.
+// Run sets up the window and enters the Ebiten event loop.
 func Run() error {
 	ebiten.SetWindowTitle("Realtime Speech Translator")
 	ebiten.SetWindowSize(WindowWidth, WindowHeight)
@@ -82,15 +155,12 @@ func Run() error {
 }
 
 // ensureBackground rebuilds the cached gradient image when the
-// window dimensions change. Painting a per-pixel gradient every
-// frame would be wasteful; this is a one-time cost per resize.
+// window dimensions change. One-time cost per resize.
 func (a *App) ensureBackground(w, h int) {
-	if a.bgImage != nil && a.bgWidth == w && a.bgHeight == h {
+	if a.bg != nil && a.bg.w == w && a.bg.h == h {
 		return
 	}
-	a.bgWidth = w
-	a.bgHeight = h
-	a.bgImage = ebiten.NewImage(w, h)
+	a.bg = &backgroundCache{w: w, h: h, image: ebiten.NewImage(w, h)}
 
 	top := a.theme.BgTop
 	bot := a.theme.BgBottom
@@ -102,80 +172,113 @@ func (a *App) ensureBackground(w, h int) {
 			B: lerp(top.B, bot.B, t),
 			A: 0xFF,
 		}
-		vector.DrawFilledRect(a.bgImage, 0, float32(y), float32(w), 1, c, false)
+		vector.DrawFilledRect(a.bg.image, 0, float32(y), float32(w), 1, c, false)
 	}
-}
-
-// drawCard paints a rounded-rectangle card with the theme's card
-// fill and border. Coordinates are top-left.
-//
-// The ebiten/v2/vector package (v2.9) ships rect / circle / line
-// primitives but no built-in rounded-rect, so we compose one out of
-// MoveTo + ArcTo on a reusable Path.
-func (a *App) drawCard(dst *ebiten.Image, x, y, w, h int) {
-	r := float32(RadiusCard)
-	if r > float32(w)/2 {
-		r = float32(w) / 2
-	}
-	if r > float32(h)/2 {
-		r = float32(h) / 2
-	}
-	path := roundedRectPath(float32(x), float32(y), float32(w), float32(h), r)
-
-	// vector paints in white and lets ColorScale tint the result —
-	// we precompute one ColorScale per draw call from the NRGBA
-	// theme tokens.
-	var fillCS ebiten.ColorScale
-	fillCS.ScaleWithColor(a.theme.Card)
-	vector.FillPath(dst, path,
-		&vector.FillOptions{},
-		&vector.DrawPathOptions{AntiAlias: true, ColorScale: fillCS},
-	)
-
-	var strokeCS ebiten.ColorScale
-	strokeCS.ScaleWithColor(a.theme.CardBorder)
-	vector.StrokePath(dst, path,
-		&vector.StrokeOptions{Width: 1},
-		&vector.DrawPathOptions{AntiAlias: true, ColorScale: strokeCS},
-	)
 }
 
 // roundedRectPath builds an outlined rounded-rectangle path with
-// corner radius r, starting at the top-left corner. Used by drawCard
-// and any future widget that wants a card silhouette.
+// corner radius r, starting at the top-left corner.
 func roundedRectPath(x, y, w, h, r float32) *vector.Path {
 	p := &vector.Path{}
-	// Top edge starts after the top-left corner.
 	p.MoveTo(x+r, y)
 	p.LineTo(x+w-r, y)
-	p.ArcTo(x+w, y, x+w, y+r, r) // top-right corner
+	p.ArcTo(x+w, y, x+w, y+r, r)
 	p.LineTo(x+w, y+h-r)
-	p.ArcTo(x+w, y+h, x+w-r, y+h, r) // bottom-right
+	p.ArcTo(x+w, y+h, x+w-r, y+h, r)
 	p.LineTo(x+r, y+h)
-	p.ArcTo(x, y+h, x, y+h-r, r) // bottom-left
+	p.ArcTo(x, y+h, x, y+h-r, r)
 	p.LineTo(x, y+r)
-	p.ArcTo(x, y, x+r, y, r) // top-left
+	p.ArcTo(x, y, x+r, y, r)
 	p.Close()
 	return p
 }
 
-// drawCenteredText is the temporary text helper used by the
-// placeholder card. Real typography lands with text/v2 in the next
-// stage; this debug version draws the string with Ebiten's default
-// proportional font.
-func (a *App) drawCenteredText(dst *ebiten.Image, x, y, w, h int, s string, c color.NRGBA) {
-	// We deliberately defer typography to the next commit; for now
-	// the card carries no text — the placeholder above is enough to
-	// confirm the gradient + card path runs end-to-end. A no-op
-	// keeps this function callable from the boot smoke without
-	// dragging the font subsystem in too early.
-	_ = s
-	_ = c
-	_ = dst
-	_ = x
-	_ = y
-	_ = w
-	_ = h
+// drawCenter paints the central sphere region. Stage 3 replaces
+// this placeholder with the Kage ray-marched shader; for now we
+// render a soft blue glow disc that breathes with a sine wave so
+// the layout is visibly alive.
+func (a *App) drawCenter(dst *ebiten.Image, r image.Rectangle) {
+	cx := float32(r.Min.X + r.Dx()/2)
+	cy := float32(r.Min.Y + r.Dy()/2)
+	radius := float32(r.Dy()) / 2.5
+	// Outer halo.
+	drawFilledCircle(dst, cx, cy, radius*1.15,
+		color.NRGBA{R: 0x4C, G: 0x66, B: 0xBF, A: 0x22})
+	drawFilledCircle(dst, cx, cy, radius*1.05,
+		color.NRGBA{R: 0x6C, G: 0x88, B: 0xFF, A: 0x44})
+	// Body.
+	drawFilledCircle(dst, cx, cy, radius, a.theme.SphereInner)
+	// Inner highlight.
+	drawFilledCircle(dst, cx-radius*0.3, cy-radius*0.3, radius*0.35,
+		color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0x33})
+}
+
+// drawBottom paints the bottom control strip — large mic button in
+// the center, mic / speaker indicators on the left, text / settings
+// on the right. Wired to actions in a follow-up.
+func (a *App) drawBottom(dst *ebiten.Image, r image.Rectangle) {
+	cy := float32(r.Min.Y + r.Dy()/2)
+
+	// Centre stack: small "audio levels" + big mic + small "translate"
+	micR := float32(34)
+	cx := float32(r.Min.X + r.Dx()/2)
+	// Big mic button.
+	drawFilledCircle(dst, cx, cy, micR*1.35,
+		color.NRGBA{R: 0x4C, G: 0x76, B: 0xFF, A: 0x22})
+	drawFilledCircle(dst, cx, cy, micR, a.theme.AccentBlue)
+	drawCircleBorder(dst, cx, cy, micR, 2, a.theme.AccentCyan)
+	// Side mini buttons.
+	sideR := float32(22)
+	drawFilledCircle(dst, cx-90, cy, sideR, a.theme.Card)
+	drawCircleBorder(dst, cx-90, cy, sideR, 1, a.theme.CardBorder)
+	drawFilledCircle(dst, cx+90, cy, sideR, a.theme.Card)
+	drawCircleBorder(dst, cx+90, cy, sideR, 1, a.theme.CardBorder)
+
+	// Hint text under the mic.
+	hw, _ := measureText(a.hint, a.fonts.Caption)
+	drawText(dst, a.hint, a.fonts.Caption,
+		int(cx)-int(hw)/2, r.Max.Y-SpaceL, a.theme.TextMuted)
+
+	// Left side: mic / speaker icons (placeholder dots + labels).
+	leftX := r.Min.X + SpaceXL*2
+	drawFilledCircle(dst, float32(leftX), cy, sideR*0.7, a.theme.Card)
+	drawCircleBorder(dst, float32(leftX), cy, sideR*0.7, 1, a.theme.CardBorder)
+	drawText(dst, "Микрофон", a.fonts.Caption, leftX-30, int(cy)+38, a.theme.TextMuted)
+
+	drawFilledCircle(dst, float32(leftX)+70, cy, sideR*0.7, a.theme.Card)
+	drawCircleBorder(dst, float32(leftX)+70, cy, sideR*0.7, 1, a.theme.CardBorder)
+	drawText(dst, "Динамик", a.fonts.Caption, leftX+40, int(cy)+38, a.theme.TextMuted)
+
+	// Right side: text / settings icons.
+	rightX := r.Max.X - SpaceXL*2
+	drawFilledCircle(dst, float32(rightX)-70, cy, sideR*0.7, a.theme.Card)
+	drawCircleBorder(dst, float32(rightX)-70, cy, sideR*0.7, 1, a.theme.CardBorder)
+	drawText(dst, "Текст", a.fonts.Caption, rightX-90, int(cy)+38, a.theme.TextMuted)
+
+	drawFilledCircle(dst, float32(rightX), cy, sideR*0.7, a.theme.Card)
+	drawCircleBorder(dst, float32(rightX), cy, sideR*0.7, 1, a.theme.CardBorder)
+	drawText(dst, "Настройки", a.fonts.Caption, rightX-26, int(cy)+38, a.theme.TextMuted)
+}
+
+// drawStatus paints the bottom-most strip (mock shows quality
+// dropdown on the left, end-call pill in the middle, timer + signal
+// on the right). Static for now.
+func (a *App) drawStatus(dst *ebiten.Image, r image.Rectangle) {
+	// Subtle separator line at the top edge of the strip.
+	vector.DrawFilledRect(dst,
+		float32(r.Min.X+SpaceL), float32(r.Min.Y),
+		float32(r.Dx()-SpaceL*2), 1,
+		color.NRGBA{R: 0x20, G: 0x24, B: 0x3A, A: 0xFF}, false)
+
+	cy := float32(r.Min.Y + r.Dy()/2)
+	drawText(dst, "Качество перевода: Высокое",
+		a.fonts.Caption,
+		r.Min.X+SpaceL*2, int(cy)+5,
+		a.theme.TextMuted)
+	drawText(dst, "00:00:00",
+		a.fonts.Caption,
+		r.Max.X-SpaceL*2-60, int(cy)+5,
+		a.theme.TextMuted)
 }
 
 func lerp(a, b uint8, t float64) uint8 {
