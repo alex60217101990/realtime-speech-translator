@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
+	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 )
 
 // Report is one written-to-disk crash record.

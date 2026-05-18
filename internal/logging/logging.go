@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
+	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 )
 
 // MaxBytes is the size at which the active log file is rotated.

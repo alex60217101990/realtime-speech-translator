@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/alex60217101990/realtime-speech-translator/internal/models/paths"
+	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 )
 
 // Settings is the persisted application configuration.
