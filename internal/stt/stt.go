@@ -177,26 +177,29 @@ func DefaultConfig() Config {
 }
 
 // DefaultToneCtcConfig returns defaults tuned for T-one streaming
-// CTC on 16 kHz mic input. The differences from DefaultConfig are
-// all about matching T-one's narrow-band telephony training:
+// CTC on 16 kHz mic input.
 //
-//   - Telephony band-pass 300–3400 Hz before AcceptWaveform.
-//   - Pre-emphasis α=0.97 on top of the band-pass to boost the
-//     unvoiced consonants the CTC head most often drops.
-//   - AGC nudges level toward -20 dBFS (telephony-typical).
-//   - Generic Whisper-style 100 Hz HPF is off — the band-pass
-//     supersedes it (HP 300 Hz is strictly stricter than HP 100 Hz).
-//   - Endpoint and VAD tightened: shorter trailing-silence rule,
-//     shorter max segment, slightly more aggressive VAD threshold.
-//     These ride T-one's own ~330 ms emission latency so we close
-//     phrases earlier without cutting off slow speakers.
+// IMPORTANT — DO NOT add band-pass / pre-emphasis / AGC here.
+//
+//	Why: T-one's feature extractor is InitRawAudioSamples (see
+//	sherpa-onnx/csrc/features.cc — `else if (config_.is_t_one)`).
+//	The model consumes raw PCM directly; the mel filterbank /
+//	pre-emphasis / log-energy steps every other ASR family applies
+//	live INSIDE the model. T-one was trained on raw G.711-codec
+//	8 kHz audio, and the sherpa LinearResample we get on 16 kHz
+//	input already produces close-to-G.711 audio (anti-alias cutoff
+//	at 0.99 × 0.5 × 8000 = 3960 Hz). Any external DSP we apply
+//	pushes the signal OUT of the training distribution and the
+//	CTC head responds by hallucinating fragments.
+//
+//	The only knobs that help are the ones around the recognizer:
+//	tight VAD so noise does not start a phrase, tight endpoint
+//	rules so phrases close at T-one's natural ~330 ms emission
+//	latency + 600 ms silence window.
 func DefaultToneCtcConfig() Config {
 	c := DefaultConfig()
 
-	// Decoder: T-one is a streaming CTC model. modified_beam_search
-	// is rejected by sherpa for streaming CTC; the constructor
-	// forces greedy regardless, but set it explicitly so the
-	// Config is honest about what runs.
+	// Decoder: streaming CTC supports only greedy in sherpa-onnx.
 	c.DecodingMethod = "greedy_search"
 	c.MaxActivePaths = 0
 
@@ -213,16 +216,11 @@ func DefaultToneCtcConfig() Config {
 	c.Rule2MinTrailingSilenceSec = 0.6
 	c.Rule3MinUtteranceLengthSec = 10
 
-	// Telephony spectral match.
-	c.TelephonyBandpass = true
-	c.PreEmphasisAlpha = 0.97
-	c.EnablePreEmphasis = false // superseded by the BP's HP 300
-
-	// Level normalisation toward telephony-typical -20 dBFS.
-	c.EnableAGC = true
-	c.AGCTargetRMS = 0.10
-	c.AGCMaxGain = 8
-	c.AGCMinRMS = 0.005
+	// DSP chain explicitly disabled — see the comment above.
+	c.EnablePreEmphasis = false
+	c.TelephonyBandpass = false
+	c.PreEmphasisAlpha = 0
+	c.EnableAGC = false
 
 	return c
 }
