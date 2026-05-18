@@ -50,6 +50,7 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/stt"
 	"github.com/alex60217101990/realtime-speech-translator/internal/tts"
+	"github.com/alex60217101990/realtime-speech-translator/internal/uihost"
 )
 
 // Config bundles everything Session needs to wire the pipeline. STT
@@ -159,6 +160,14 @@ type Session struct {
 
 	// Sentence stitching state. Only touched from routeSTT.
 	stitch stitchState
+
+	// AudioBucket stream — populated by the capture PushFunc wrap
+	// when bucketsCh is non-nil (Wails UI subscribes). One bucket
+	// per audio chunk (~16–100 ms). Drop on overflow; the
+	// renderer is best-effort.
+	bucketsCh   chan uihost.AudioBucket
+	bucketsSpec *uihost.Spectrum
+	speakingFl  atomic.Bool
 }
 
 // Sentence-stitching tunables. Same values as perf/simd-mt-tuning.
@@ -224,8 +233,21 @@ func New(cfg Config) (*Session, error) {
 	}
 
 	// Wrap stt.Push with a half-duplex gate so audio captured while
-	// TTS is playing never reaches the recognizer.
+	// TTS is playing never reaches the recognizer. The same wrapper
+	// also drives the AudioBucket stream when a UI is subscribed —
+	// done before the mute gate so the sphere still pulses with
+	// the user's own voice even when we are dropping samples on
+	// the floor for STT.
 	push := func(samples []float32) {
+		if s.bucketsCh != nil && s.bucketsSpec != nil {
+			b := s.bucketsSpec.Bucket(samples)
+			b.Speaking = s.speakingFl.Load()
+			select {
+			case s.bucketsCh <- b:
+			default:
+				// renderer behind; drop quietly.
+			}
+		}
 		if time.Now().UnixNano() < s.muteUntilNs.Load() {
 			s.micDropped.Add(1)
 			return
@@ -276,6 +298,24 @@ func New(cfg Config) (*Session, error) {
 // Events returns the read end of the event stream. Closes when Stop
 // completes draining or Close releases the session.
 func (s *Session) Events() <-chan Event { return s.events }
+
+// EnableAudioBuckets attaches an FFT-driven AudioBucket stream that
+// the UI sphere shader subscribes to. Call BEFORE Start. capacity
+// bounds the channel; once full, new buckets are dropped silently
+// (the renderer is best-effort by design).
+func (s *Session) EnableAudioBuckets(capacity int) <-chan uihost.AudioBucket {
+	if s.running.Load() {
+		// Subscribing after Start would race the push wrapper;
+		// fail noisily rather than silently lose buckets.
+		panic("app: EnableAudioBuckets must be called before Start")
+	}
+	if capacity <= 0 {
+		capacity = 60
+	}
+	s.bucketsCh = make(chan uihost.AudioBucket, capacity)
+	s.bucketsSpec = uihost.NewSpectrum(s.cfg.STTSampleRate, 1024)
+	return s.bucketsCh
+}
 
 // Start launches the engines and audio devices. Returns once
 // background goroutines are running; subsequent Stop/Close handle
@@ -603,6 +643,7 @@ func (s *Session) runTTS(ctx context.Context) {
 				continue
 			}
 			s.log.Debug("tts speak", "text", trunc(text, 60))
+			s.speakingFl.Store(true)
 			s.emit(ctx, Speaking{Active: true})
 			start := time.Now()
 			chunks := s.tts.Speak(ctx, text)
@@ -651,6 +692,7 @@ func (s *Session) runTTS(ctx context.Context) {
 				"samples", totalSamples,
 				"ms", elapsed.Milliseconds(),
 			)
+			s.speakingFl.Store(false)
 			s.emit(ctx, Speaking{Active: false})
 		}
 	}
