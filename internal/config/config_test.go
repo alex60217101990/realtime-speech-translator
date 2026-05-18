@@ -26,11 +26,20 @@ func TestDefault(t *testing.T) {
 	if s.SourceLang == "" || s.TargetLang == "" {
 		t.Fatal("default lang fields empty")
 	}
-	if s.WhisperModel != "small" {
-		t.Fatalf("expected small, got %q", s.WhisperModel)
+	if s.STTModel == "" {
+		t.Fatal("default STT model empty")
+	}
+	if s.MTBackend == "" {
+		t.Fatal("default MT backend empty")
+	}
+	if s.TTSVoice == "" {
+		t.Fatal("default TTS voice empty")
 	}
 	if s.Theme != "system" {
 		t.Fatalf("expected system theme, got %q", s.Theme)
+	}
+	if s.VADThreshold <= 0 || s.VADThreshold >= 1 {
+		t.Fatalf("VADThreshold = %v, must be in (0,1)", s.VADThreshold)
 	}
 }
 
@@ -51,9 +60,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	want.SourceLang = "ru"
 	want.TargetLang = "en"
 	want.Threads = 4
-	want.VADAggressiveness = 3
+	want.VADThreshold = 0.6
 	want.OutputDevice = "BlackHole"
 	want.Theme = "dark"
+	want.MTBackend = "opusmt"
 	if err := Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +82,7 @@ func TestLoadIgnoresUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := []byte("source_lang: en\nfuture_field: someval\nwhisper_model: tiny\n")
+	body := []byte("source_lang: en\nfuture_field: someval\nstt_model: foo\n")
 	if err := os.WriteFile(p, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +90,7 @@ func TestLoadIgnoresUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected to ignore unknown fields, got %v", err)
 	}
-	if got.SourceLang != "en" || got.WhisperModel != "tiny" {
+	if got.SourceLang != "en" || got.STTModel != "foo" {
 		t.Fatalf("partial load failed: %+v", got)
 	}
 }

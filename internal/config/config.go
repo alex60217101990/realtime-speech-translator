@@ -13,32 +13,51 @@ import (
 	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
 )
 
-// Settings is the persisted application configuration.
+// Settings is the persisted application configuration. Fields map to
+// the new sherpa-onnx architecture: streaming Zipformer STT, sherpa
+// in-process Piper TTS, optional CT2 MT (small100 / opusmt) gated by
+// the `mt` build tag.
 type Settings struct {
-	// SourceLang ISO-639-1 or "auto".
+	// SourceLang ISO-639-1 (or "auto" — currently treated as a hint
+	// for MT only; the streaming Zipformer is fundamentally
+	// multilingual or per-language depending on the chosen model).
 	SourceLang string `yaml:"source_lang"`
 	// TargetLang ISO-639-1.
 	TargetLang string `yaml:"target_lang"`
 
-	// WhisperModel: tiny|base|small|medium|large.
-	WhisperModel string `yaml:"whisper_model"`
-	// MTBackend: madlad|opusmt|off.
+	// STTModel is the directory name under <data>/models/stt/. The
+	// directory must contain encoder.onnx, decoder.onnx, joiner.onnx
+	// and tokens.txt for a streaming Zipformer transducer.
+	STTModel string `yaml:"stt_model"`
+
+	// MTBackend selects the translation engine. Valid values:
+	//   "small100" — distilled M2M-100, one model for 100 languages.
+	//   "opusmt"   — per-pair Helsinki-NLP, fastest.
+	//   "off"      — passthrough (mt.Disabled).
+	// When the binary was built without `-tags mt`, the latter is
+	// the only working option; the others fall back to "off" at
+	// session-construction time with a logged warning.
 	MTBackend string `yaml:"mt_backend"`
 
-	// Threads is the per-engine thread cap; 0 = auto.
+	// TTSVoice is the directory name under <data>/models/tts/. The
+	// directory must contain model.onnx + tokens.txt + espeak-ng-data/
+	// (the standard Piper VITS layout).
+	TTSVoice string `yaml:"tts_voice"`
+
+	// Threads is the per-engine thread cap; 0 = runtime.NumCPU().
 	Threads int `yaml:"threads"`
 
-	// VADAggressiveness 0..3.
-	VADAggressiveness int `yaml:"vad_aggressiveness"`
+	// VADThreshold is the Silero VAD speech probability gate. 0.0
+	// passes everything; 1.0 nothing. 0.5 is the published default.
+	VADThreshold float32 `yaml:"vad_threshold"`
 
-	// OutputDevice is a name substring matched by vmic; empty =
-	// first detected virtual mic.
+	// OutputDevice is a name substring matched by vmic; empty = first
+	// detected virtual mic.
 	OutputDevice string `yaml:"output_device"`
 
-	// TTSEnabled toggles Piper playback.
+	// TTSEnabled toggles synthesis + playback. When false the
+	// pipeline still emits Translation events; nothing is spoken.
 	TTSEnabled bool `yaml:"tts_enabled"`
-	// TTSBinaryPath overrides the PATH-resolved Piper binary.
-	TTSBinaryPath string `yaml:"tts_binary_path"`
 
 	// Theme: light|dark|system.
 	Theme string `yaml:"theme"`
@@ -47,16 +66,16 @@ type Settings struct {
 // Default returns the factory defaults used on first launch.
 func Default() Settings {
 	return Settings{
-		SourceLang:        "auto",
-		TargetLang:        "en",
-		WhisperModel:      "small",
-		MTBackend:         "madlad",
-		Threads:           0,
-		VADAggressiveness: 2,
-		OutputDevice:      "",
-		TTSEnabled:        true,
-		TTSBinaryPath:     "",
-		Theme:             "system",
+		SourceLang:   "auto",
+		TargetLang:   "en",
+		STTModel:     "zipformer-streaming-multi-en-zh",
+		MTBackend:    "small100",
+		TTSVoice:     "piper-en-amy-medium",
+		Threads:      0,
+		VADThreshold: 0.5,
+		OutputDevice: "",
+		TTSEnabled:   true,
+		Theme:        "system",
 	}
 }
 
