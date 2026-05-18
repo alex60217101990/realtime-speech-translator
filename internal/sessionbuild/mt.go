@@ -1,0 +1,102 @@
+package sessionbuild
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/alex60217101990/realtime-speech-translator/internal/config"
+	"github.com/alex60217101990/realtime-speech-translator/internal/mt"
+	"github.com/alex60217101990/realtime-speech-translator/internal/paths"
+)
+
+// buildMT constructs the MT engine but does not wrap it in the
+// translation-memory cache. Callers usually want buildMTWithCache
+// instead.
+func buildMT(cfg config.Settings) (mt.Engine, error) {
+	root, err := paths.OPUSMTRoot()
+	if err != nil {
+		return nil, err
+	}
+	sm, err := paths.MTDir("small100-int8")
+	if err != nil {
+		return nil, err
+	}
+	m2m, err := paths.MTDir("m2m100-418m-int8")
+	if err != nil {
+		return nil, err
+	}
+
+	backend := resolveMTBackend(cfg.MTBackend, sm, m2m, root)
+	if backend != cfg.MTBackend {
+		slog.Info("sessionbuild: mt backend auto-resolved",
+			"requested", cfg.MTBackend, "using", backend)
+	}
+
+	return mt.Build(mt.FactoryConfig{
+		Backend:          backend,
+		M2M100ModelDir:   m2m,
+		M2M100SPModel:    filepath.Join(m2m, "sentencepiece.bpe.model"),
+		SMaLL100ModelDir: sm,
+		SMaLL100SPModel:  filepath.Join(sm, "sentencepiece.bpe.model"),
+		OPUSMTRoot:       root,
+		Threads:          cfg.Threads,
+	})
+}
+
+// buildMTWithCache wraps the resolved MT engine in a disk-backed
+// translation-memory cache. Returns the cache-wrapped Engine plus
+// the underlying *mt.Cached so the UI can call Override() / Sync().
+func buildMTWithCache(cfg config.Settings) (mt.Engine, *mt.Cached, error) {
+	base, err := buildMT(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	tmPath, err := paths.TranslationMemory()
+	if err != nil {
+		return base, nil, fmt.Errorf("tm path: %w", err)
+	}
+	cached, err := mt.LoadCached(base, 1024, tmPath)
+	if err != nil {
+		slog.Warn("sessionbuild: tm load failed; starting empty cache", "err", err)
+		cached = mt.NewCached(base, 1024).(*mt.Cached)
+	}
+	return cached, cached, nil
+}
+
+// resolveMTBackend falls back to whatever MT model is actually
+// usable on disk when the requested backend has no files.
+func resolveMTBackend(requested, smDir, m2mDir, opusRoot string) string {
+	want := strings.ToLower(strings.TrimSpace(requested))
+	if want == "off" {
+		return "off"
+	}
+	usable := func(b string) bool {
+		switch b {
+		case "m2m100":
+			return fileExists(filepath.Join(m2mDir, "model.bin"))
+		case "small100":
+			return fileExists(filepath.Join(smDir, "model.bin"))
+		case "opusmt":
+			entries, _ := os.ReadDir(opusRoot)
+			for _, e := range entries {
+				if e.IsDir() {
+					return true
+				}
+			}
+			return false
+		}
+		return false
+	}
+	if want != "" && want != "auto" && usable(want) {
+		return want
+	}
+	for _, b := range []string{"m2m100", "small100", "opusmt"} {
+		if usable(b) {
+			return b
+		}
+	}
+	return "off"
+}

@@ -21,17 +21,28 @@ const (
 	WindowHeight = 800
 )
 
-// sessionStatus enumerates the values the header pill displays.
-// Values match the strings emitted by the cmd layer when it owns a
-// Session; the UI is happy to render any of them.
-type sessionStatus int
+// SessionStatus enumerates the values the header pill displays.
+// Exported so the cmd layer can drive it via SetStatus without
+// going through a string contract.
+type SessionStatus int
 
 const (
-	statusRunning sessionStatus = iota
-	statusWaiting
-	statusStopped
-	statusError
+	StatusRunning SessionStatus = iota
+	StatusWaiting
+	StatusStopped
+	StatusError
 )
+
+// Backwards-compatible private aliases used by the internal code
+// in this package.
+const (
+	statusRunning = StatusRunning
+	statusWaiting = StatusWaiting
+	statusStopped = StatusStopped
+	statusError   = StatusError
+)
+
+type sessionStatus = SessionStatus
 
 // App is the top-level Ebiten Game. State is kept under a single
 // mutex because the bindings push new transcript / translation
@@ -83,7 +94,7 @@ func (a *App) SetAudio(s SphereAudio) {
 }
 
 // SetStatus updates the header pill from the binding goroutine.
-func (a *App) SetStatus(s sessionStatus) {
+func (a *App) SetStatus(s SessionStatus) {
 	a.mu.Lock()
 	a.status = s
 	a.mu.Unlock()
