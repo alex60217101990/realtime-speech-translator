@@ -156,6 +156,26 @@ type Session struct {
 	// every time runTTS emits.
 	muteUntilNs atomic.Int64
 	micDropped  atomic.Uint64
+
+	// Sentence stitching state. Only touched from routeSTT.
+	stitch stitchState
+}
+
+// Sentence-stitching tunables. Same values as perf/simd-mt-tuning.
+const (
+	stitchWindow         = 700 * time.Millisecond // wait this long for the next fragment
+	stitchMaxFragments   = 4                      // never stitch more than this many finals
+	stitchMaxFragmentSec = 4                      // a Final longer than this is flushed on its own
+)
+
+// stitchState buffers consecutive Finals that arrive within
+// stitchWindow of each other and lack terminal punctuation, so the
+// MT engine receives one coherent sentence instead of two clauses.
+type stitchState struct {
+	buf      []string
+	firstAt  time.Time
+	timer    *time.Timer
+	flushCh  chan string // capacity 1; routeSTT consumes when timer fires
 }
 
 // New constructs the Session, opens the audio devices and loads the
@@ -321,34 +341,190 @@ func (s *Session) Start(ctx context.Context) error {
 }
 
 // routeSTT forwards Partials to the UI events channel and pushes
-// Finals into the MT queue. Drops on full queue rather than blocking
-// the STT hot loop.
+// Finals into the MT queue with two pieces of perf-branch logic
+// in front: a hallucination filter that drops known model garbage,
+// and a sentence-stitching guard that batches mid-clause Finals
+// into one MT input so the translator gets a coherent sentence.
 func (s *Session) routeSTT(ctx context.Context) {
 	defer s.wg.Done()
+
+	s.stitch.flushCh = make(chan string, 1)
 
 	for {
 		select {
 		case <-ctx.Done():
+			s.stitchStop()
 			return
+
+		case batch := <-s.stitch.flushCh:
+			// Timer fired — window expired without terminal
+			// punctuation; flush whatever we have.
+			s.routeMT(ctx, batch)
+
 		case ev, ok := <-s.stt.Events():
 			if !ok {
+				s.stitchStop()
 				return
 			}
 			switch e := ev.(type) {
 			case stt.Partial:
 				s.log.Debug("stt partial", "text", trunc(e.Text, 80))
 				s.emit(ctx, Partial{Text: e.Text})
+
 			case stt.Final:
-				s.log.Info("stt final", "text", trunc(e.Text, 120))
-				s.emit(ctx, Final{Text: e.Text})
-				select {
-				case s.mtQ <- e.Text:
-				default:
-					s.mtDrops.Add(1)
-					s.log.Warn("app: MT queue full, dropping final", "text", trunc(e.Text, 60))
+				text := strings.TrimSpace(e.Text)
+				if text == "" {
+					continue
 				}
+				if isHallucination(text) {
+					s.log.Info("stt final dropped: hallucination", "text", trunc(text, 80))
+					continue
+				}
+				s.log.Info("stt final", "text", trunc(text, 120))
+				s.emit(ctx, Final{Text: text})
+				s.stitchAdd(ctx, text)
 			}
 		}
+	}
+}
+
+// stitchAdd folds a Final into the stitch buffer. If the fragment
+// completes a sentence (terminal punctuation, fragment cap, max
+// duration), it flushes immediately. Otherwise the routine arms a
+// timer that wakes routeSTT after stitchWindow.
+func (s *Session) stitchAdd(ctx context.Context, text string) {
+	s.stitch.buf = append(s.stitch.buf, text)
+	if s.stitch.firstAt.IsZero() {
+		s.stitch.firstAt = time.Now()
+	}
+
+	tooLong := time.Since(s.stitch.firstAt) >= time.Duration(stitchMaxFragmentSec)*time.Second
+	enough := len(s.stitch.buf) >= stitchMaxFragments
+	terminal := endsTerminal(text)
+
+	if terminal || enough || tooLong {
+		s.stitchFlush(ctx)
+		return
+	}
+
+	// Arm / re-arm timer for stitchWindow.
+	if s.stitch.timer != nil {
+		s.stitch.timer.Stop()
+	}
+	s.stitch.timer = time.AfterFunc(stitchWindow, func() {
+		// Compose stitched text and send via the flush channel —
+		// routeSTT consumes it from its own goroutine so we keep
+		// all stitch state single-threaded.
+		select {
+		case s.stitch.flushCh <- strings.Join(s.stitch.buf, " "):
+		default:
+			// previous flush still pending; routeSTT will pick
+			// it up. Either way we will reset state on its side.
+		}
+	})
+}
+
+// stitchFlush sends the buffered fragments straight to MT and clears
+// the stitch state.
+func (s *Session) stitchFlush(ctx context.Context) {
+	if len(s.stitch.buf) == 0 {
+		return
+	}
+	full := strings.Join(s.stitch.buf, " ")
+	s.stitch.buf = s.stitch.buf[:0]
+	s.stitch.firstAt = time.Time{}
+	if s.stitch.timer != nil {
+		s.stitch.timer.Stop()
+		s.stitch.timer = nil
+	}
+	s.routeMT(ctx, full)
+}
+
+// stitchStop drops any pending stitch state on shutdown.
+func (s *Session) stitchStop() {
+	if s.stitch.timer != nil {
+		s.stitch.timer.Stop()
+		s.stitch.timer = nil
+	}
+	s.stitch.buf = nil
+}
+
+// routeMT pushes one composed sentence onto the MT queue, counting
+// drops when the worker can't keep up.
+func (s *Session) routeMT(ctx context.Context, text string) {
+	select {
+	case s.mtQ <- text:
+	case <-ctx.Done():
+	default:
+		s.mtDrops.Add(1)
+		s.log.Warn("app: MT queue full, dropping final", "text", trunc(text, 60))
+	}
+}
+
+// endsTerminal reports whether the trimmed text ends in a sentence-
+// closing punctuation mark.
+func endsTerminal(text string) bool {
+	t := strings.TrimRight(text, " \t\n\r")
+	if t == "" {
+		return false
+	}
+	last := t[len(t)-1]
+	switch last {
+	case '.', '?', '!':
+		return true
+	}
+	// Multi-byte "…" check — three bytes 0xE2 0x80 0xA6.
+	if len(t) >= 3 && t[len(t)-3] == 0xE2 && t[len(t)-2] == 0x80 && t[len(t)-1] == 0xA6 {
+		return true
+	}
+	return false
+}
+
+// hallucinationFingerprints is a small, conservative deny-list of
+// canned phrases the upstream models are known to emit on noise or
+// silence. Lowercased, trimmed, with []/() content stripped before
+// comparison.
+var hallucinationFingerprints = map[string]struct{}{
+	// Russian YouTube credit lines that whisper / NeMo sometimes
+	// hallucinate over white noise:
+	"субтитры от dimatorzok":                {},
+	"продолжение в комментариях":            {},
+	"подпишись на канал":                    {},
+	"спасибо за просмотр":                   {},
+	"корректор":                             {},
+	"редактор субтитров":                    {},
+	// English YouTube credit / outro lines:
+	"thanks for watching":     {},
+	"like and subscribe":      {},
+	"please subscribe":        {},
+	"see you next time":       {},
+	"see you in the next one": {},
+}
+
+func isHallucination(text string) bool {
+	norm := strings.ToLower(strings.TrimSpace(text))
+	// strip "[ ... ]" and "( ... )" content cheaply.
+	norm = stripBracketed(norm, '[', ']')
+	norm = stripBracketed(norm, '(', ')')
+	norm = strings.TrimSpace(norm)
+	if norm == "" {
+		return true
+	}
+	_, hit := hallucinationFingerprints[norm]
+	return hit
+}
+
+func stripBracketed(s string, open, close byte) string {
+	for {
+		i := strings.IndexByte(s, open)
+		if i < 0 {
+			return s
+		}
+		j := strings.IndexByte(s[i:], close)
+		if j < 0 {
+			return s[:i]
+		}
+		s = s[:i] + s[i+j+1:]
 	}
 }
 
@@ -644,6 +820,16 @@ type Stats struct {
 	// me" complaints — if this counter is growing while you speak,
 	// playback is bleeding into the gate.
 	MicMutedDropped uint64
+
+	// Translation memory stats — surfaced via the optional TMStats()
+	// accessor on the wrapped engine. cmd layer fills them in
+	// because it owns the *mt.Cached pointer; session does not see
+	// the cache type.
+	TMSize    int
+	TMPinned  uint64
+	TMHits    uint64
+	TMMisses  uint64
+	TMHitRate float64
 }
 
 // Stats returns a point-in-time snapshot for the UI status line.

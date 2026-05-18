@@ -36,6 +36,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	rstapp "github.com/alex60217101990/realtime-speech-translator/internal/app"
@@ -182,7 +183,7 @@ func main() {
 			state = sessionState{}
 		}
 
-		session, nativeTTS, err := buildSession(cfg)
+		session, nativeTTS, mtCache, err := buildSession(cfg)
 		if err != nil {
 			if errors.Is(err, errModelsMissing) {
 				slog.Warn("session not started; install models via the Models tab", "err", err)
@@ -214,12 +215,13 @@ func main() {
 		}
 		state.session = session
 		state.nativeTTS = nativeTTS
+		state.mtCache = mtCache
 		fyne.Do(func() {
 			liveCtl.currentStatus = "running"
 			liveCtl.partial.SetText("")
 			refreshHeader(liveCtl, cfg)
 		})
-		go pumpEvents(ctx, session, liveCtl, nativeTTS, &cfg)
+		go pumpEvents(ctx, session, liveCtl, nativeTTS, &cfg, mtCache)
 	}
 
 	ctl := liveCtl
@@ -235,6 +237,11 @@ func main() {
 		slog.Info("ui: stop button — tearing down session")
 		_ = state.session.Stop()
 		_ = state.session.Close()
+		if state.mtCache != nil {
+			if err := state.mtCache.Sync(); err != nil {
+				slog.Warn("tm sync on stop failed", "err", err)
+			}
+		}
 		state = sessionState{}
 		fyne.Do(func() {
 			ctl.currentStatus = "stopped"
@@ -242,6 +249,45 @@ func main() {
 			ctl.partial.SetText("")
 			refreshStatusBlock(ctl, rstapp.Stats{})
 		})
+	}
+
+	// Fix-last-translation dialog: lets the user correct the most
+	// recent translation; the correction is pinned in the TM
+	// cache and replayed on every subsequent identical source.
+	ctl.fixBtn.OnTapped = func() {
+		ctl.lastSrcMu.Lock()
+		src := ctl.lastSrc
+		tgt := ctl.lastTgt
+		ctl.lastSrcMu.Unlock()
+		if src == "" {
+			return
+		}
+
+		stateMu.Lock()
+		cache := state.mtCache
+		stateMu.Unlock()
+		if cache == nil {
+			return
+		}
+
+		srcLabel := widget.NewLabel(fmt.Sprintf("[%s] %s", nonEmpty(cfg.SourceLang, "src"), src))
+		srcLabel.Wrapping = fyne.TextWrapWord
+		entry := widget.NewMultiLineEntry()
+		entry.SetText(tgt)
+		entry.Wrapping = fyne.TextWrapWord
+
+		dlg := newFixDialog(w, srcLabel, entry, func(corrected string) {
+			corrected = strings.TrimSpace(corrected)
+			if corrected == "" {
+				return
+			}
+			cache.Override(src, cfg.SourceLang, cfg.TargetLang, corrected)
+			if err := cache.Sync(); err != nil {
+				slog.Warn("tm sync after override failed", "err", err)
+			}
+			slog.Info("translation overridden", "src", truncate(src, 80), "tgt", truncate(corrected, 80))
+		})
+		dlg.Show()
 	}
 
 	ctl.startBtn.OnTapped = func() {
@@ -287,17 +333,27 @@ func main() {
 		if state.session != nil {
 			_ = state.session.Close()
 		}
+		if state.mtCache != nil {
+			if err := state.mtCache.Sync(); err != nil {
+				slog.Warn("tm sync on close failed", "err", err)
+			}
+		}
 		stateMu.Unlock()
 	})
 
 	w.ShowAndRun()
 }
 
-// sessionState bundles the live session and the optional native TTS
-// fallback so the lifecycle goroutine can swap both atomically.
+// sessionState bundles the live session, the optional native TTS
+// fallback, and the in-memory MT cache so the Fix-last-translation
+// dialog can call Override + Sync without reaching into the
+// session graph.
 type sessionState struct {
 	session   *rstapp.Session
 	nativeTTS *native.Engine
+	mtCache   *mt.Cached
+	lastSrc   string // most recent stt Final, for the Fix dialog
+	lastTgt   string // most recent MT Translation
 }
 
 // buildSession resolves all model paths from the settings + paths
@@ -310,13 +366,13 @@ type sessionState struct {
 // cmd layer to invoke directly from the event pump. Returns
 // nativeTTS == nil when sherpa Piper loaded successfully or when
 // the host has no usable native synthesizer either.
-func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) {
+func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, *mt.Cached, error) {
 	// Resolve "auto" / smart-pick into a concrete model name based
 	// on SourceLang and what the user actually has installed under
 	// <data>/models/stt/.
 	resolvedSTT, autoNote := resolveSTTModel(cfg)
 	if resolvedSTT == "" {
-		return nil, nil, fmt.Errorf("%w: no STT model installed under <data>/models/stt/", errModelsMissing)
+		return nil, nil, nil, fmt.Errorf("%w: no STT model installed under <data>/models/stt/", errModelsMissing)
 	}
 	if autoNote != "" {
 		slog.Info("stt auto-select", "picked", resolvedSTT, "reason", autoNote)
@@ -324,18 +380,18 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 
 	sttDir, err := paths.STTDir(resolvedSTT)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stt dir: %w", err)
+		return nil, nil, nil, fmt.Errorf("stt dir: %w", err)
 	}
 	vadPath, err := paths.VADModel()
 	if err != nil {
-		return nil, nil, fmt.Errorf("vad path: %w", err)
+		return nil, nil, nil, fmt.Errorf("vad path: %w", err)
 	}
 	tokensPath := filepath.Join(sttDir, "tokens.txt")
 	if _, err := os.Stat(tokensPath); err != nil {
-		return nil, nil, fmt.Errorf("%w: stt/%s/tokens.txt", errModelsMissing, resolvedSTT)
+		return nil, nil, nil, fmt.Errorf("%w: stt/%s/tokens.txt", errModelsMissing, resolvedSTT)
 	}
 	if _, err := os.Stat(vadPath); err != nil {
-		return nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
+		return nil, nil, nil, fmt.Errorf("%w: vad/silero_vad.onnx", errModelsMissing)
 	}
 
 	// Backend factory: pick the right stt.Backend implementation by
@@ -348,7 +404,7 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	resolvedCfg.STTModel = resolvedSTT
 	sttBackend, kindName, err := buildSTTBackend(resolvedCfg, sttDir, tokensPath, vadPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	slog.Info("stt backend resolved",
 		"model_name", resolvedSTT,
@@ -378,10 +434,16 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 		}
 	}
 
-	mtEngine, err := buildMT(cfg)
+	mtEngine, mtCache, err := buildMTWithCache(cfg)
 	if err != nil {
 		slog.Warn("mt unavailable; running passthrough", "err", err)
 		mtEngine = mt.Disabled{}
+		mtCache = nil
+	}
+	if mtCache != nil {
+		st := mtCache.Stats()
+		slog.Info("translation memory loaded",
+			"entries", st.Size, "pinned", st.Pinned)
 	}
 
 	sess, err := rstapp.New(rstapp.Config{
@@ -396,9 +458,9 @@ func buildSession(cfg config.Settings) (*rstapp.Session, *native.Engine, error) 
 	})
 	if err != nil {
 		_ = sttBackend.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sess, nativeFallback, nil
+	return sess, nativeFallback, mtCache, nil
 }
 
 // buildSTTBackend picks the right stt.Backend by inspecting the
@@ -569,6 +631,32 @@ func buildMT(cfg config.Settings) (mt.Engine, error) {
 	})
 }
 
+// buildMTWithCache wraps the resolved MT engine in a disk-backed
+// translation-memory cache. On boot we restore previous translations
+// from <data>/translation_memory.json so repeated phrases hit
+// instantly; the cache also persists user corrections (see Fix-
+// last-translation dialog) which Override() never evicts.
+//
+// Returns the cache-wrapped Engine plus the underlying *mt.Cached so
+// the UI can call Override() and Stats() directly.
+func buildMTWithCache(cfg config.Settings) (mt.Engine, *mt.Cached, error) {
+	base, err := buildMT(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	tmPath, err := paths.TranslationMemory()
+	if err != nil {
+		return base, nil, fmt.Errorf("tm path: %w", err)
+	}
+	cached, err := mt.LoadCached(base, 1024, tmPath)
+	if err != nil {
+		// Disk read failures are non-fatal — start fresh.
+		slog.Warn("tm load failed; starting empty cache", "err", err)
+		cached = mt.NewCached(base, 1024).(*mt.Cached)
+	}
+	return cached, cached, nil
+}
+
 // liveControls bundles the widgets the event pump updates.
 type liveControls struct {
 	header        *widget.Label
@@ -579,11 +667,20 @@ type liveControls struct {
 	speakingDot   *widget.Label
 	viz           *ui.VoiceViz
 	startBtn      *widget.Button
+	fixBtn        *widget.Button
 	transcript    *widget.List
 	transcriptD   []string
 	translation   *widget.List
 	translationD  []string
 	currentStatus string
+
+	// Last STT Final + MT Translation seen, used by the Fix-last-
+	// translation dialog. Guarded by lastSrcMu because they are
+	// written from the event-pump goroutine and read from the
+	// button callback on the UI thread.
+	lastSrcMu sync.Mutex
+	lastSrc   string
+	lastTgt   string
 }
 
 func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
@@ -619,6 +716,7 @@ func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
 	refreshStatusBlock(ctl, rstapp.Stats{})
 
 	ctl.startBtn = widget.NewButton("Start", nil)
+	ctl.fixBtn = widget.NewButton("Fix last translation", nil)
 
 	top := container.NewVBox(
 		ctl.header,
@@ -629,7 +727,7 @@ func buildLiveTab(cfg config.Settings) (fyne.CanvasObject, *liveControls) {
 
 	center := container.NewBorder(nil, nil, nil, ctl.speakingDot, ctl.viz)
 
-	buttons := container.NewGridWithColumns(1, ctl.startBtn)
+	buttons := container.NewGridWithColumns(2, ctl.startBtn, ctl.fixBtn)
 
 	twoCol := container.NewGridWithColumns(2,
 		container.NewBorder(
@@ -711,9 +809,36 @@ func refreshStatusBlock(ctl *liveControls, st rstapp.Stats) {
 		st.PlaybackUnderrn,
 	))
 	ctl.lagLine.SetText(fmt.Sprintf(
-		"v%s   prev_mt: %s   prev_tts: %s",
+		"v%s   prev_mt: %s   prev_tts: %s   TM: %d entries (%d pinned)   hits=%d miss=%d (%.0f%%)",
 		version, fmtMs(st.MTLast), fmtMs(st.TTSLast),
+		st.TMSize, st.TMPinned, st.TMHits, st.TMMisses, st.TMHitRate*100,
 	))
+}
+
+// newFixDialog assembles the Fix-last-translation modal: shows the
+// source line, lets the user edit the target, calls onSave on Save.
+func newFixDialog(w fyne.Window, src fyne.CanvasObject, target *widget.Entry, onSave func(string)) dialog.Dialog {
+	body := container.NewVBox(
+		widget.NewLabelWithStyle("Source", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+		src,
+		widget.NewLabelWithStyle("Translation (edit and save to pin)", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+		target,
+	)
+	d := dialog.NewCustomConfirm("Fix last translation", "Save", "Cancel", body, func(ok bool) {
+		if !ok {
+			return
+		}
+		onSave(target.Text)
+	}, w)
+	d.Resize(fyne.NewSize(560, 320))
+	return d
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func fmtMs(d time.Duration) string {
@@ -730,7 +855,7 @@ func fmtMs(d time.Duration) string {
 // When nativeTTS is non-nil the session itself runs with TTS off and
 // every Translation event is forwarded to the native synthesizer in
 // a fire-and-forget goroutine.
-func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativeTTS *native.Engine, cfg *config.Settings) {
+func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativeTTS *native.Engine, cfg *config.Settings, cache *mt.Cached) {
 	statusTick := time.NewTicker(500 * time.Millisecond)
 	defer statusTick.Stop()
 
@@ -740,6 +865,15 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 			return
 		case <-statusTick.C:
 			st := s.Stats()
+			// Mix in TM cache stats — cmd owns the cache pointer.
+			if cache != nil {
+				cs := cache.Stats()
+				st.TMSize = cs.Size
+				st.TMPinned = cs.Pinned
+				st.TMHits = cs.Hits
+				st.TMMisses = cs.Misses
+				st.TMHitRate = cs.HitRate
+			}
 			fyne.Do(func() {
 				refreshStatusBlock(ctl, st)
 				ctl.viz.SetLevel(st.MicRMS*4, st.VADActivePct > 0)
@@ -755,6 +889,9 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 				fyne.Do(func() { ctl.partial.SetText(txt) })
 
 			case rstapp.Final:
+				ctl.lastSrcMu.Lock()
+				ctl.lastSrc = e.Text
+				ctl.lastSrcMu.Unlock()
 				line := fmt.Sprintf("[%s] %s", nonEmpty(cfg.SourceLang, "src"), e.Text)
 				fyne.Do(func() {
 					ctl.partial.SetText("")
@@ -762,6 +899,9 @@ func pumpEvents(ctx context.Context, s *rstapp.Session, ctl *liveControls, nativ
 				})
 
 			case rstapp.Translation:
+				ctl.lastSrcMu.Lock()
+				ctl.lastTgt = e.Target
+				ctl.lastSrcMu.Unlock()
 				line := fmt.Sprintf("[%s] %s", nonEmpty(cfg.TargetLang, "tgt"), e.Target)
 				fyne.Do(func() { appendTranslation(ctl, line) })
 				if nativeTTS != nil && e.Target != "" {
