@@ -6,6 +6,12 @@
 .DS_Store
 .vscode/
 .idea/
+.cursor/
+.gemini/
+.clinerules
+.windsurfrules
+AGENTS.md
+opencode.json
 third_party/build/
 docs/obsidian/.obsidian/
 graphify-out/
