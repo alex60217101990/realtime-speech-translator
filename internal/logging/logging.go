@@ -72,7 +72,8 @@ func Init(opts Options) (close func() error, err error) {
 	fileHandler := slog.NewJSONHandler(rotator, &slog.HandlerOptions{Level: slog.LevelDebug})
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 
-	multi := &multiHandler{handlers: []slog.Handler{fileHandler, stderrHandler}}
+	ringH := newRingHandler()
+	multi := &multiHandler{handlers: []slog.Handler{fileHandler, stderrHandler, ringH}}
 	slog.SetDefault(slog.New(multi))
 
 	slog.Info("logging initialised",

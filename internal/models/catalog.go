@@ -213,5 +213,29 @@ func DefaultCatalog() []Entry {
 				"model.bin", "config.json", "sentencepiece.bpe.model",
 			},
 		},
+		{
+			// SMaLL-100 is a distilled M2M-100 (~330 MB int8). The MT
+			// loader (internal/mt/small100.go) supports it, but we
+			// don't yet host a CT2-exported tarball — the UI shows
+			// this entry as "URL TBD" so the user can see the
+			// backend is wired and ready for a future release.
+			Kind:        KindMT,
+			Name:        "small100-int8",
+			DisplayName: "SMaLL-100 int8 (distilled M2M-100, CT2)",
+			License:     "MIT (Microsoft SMaLL-100)",
+			URL:         "",
+			SizeBytes:   330_000_000,
+			Tarball:     true,
+			BackendName: "small100",
+			Layout: map[string]string{
+				"model.bin":               "model.bin",
+				"config.json":             "config.json",
+				"shared_vocabulary.json":  "shared_vocabulary.json",
+				"sentencepiece.bpe.model": "sentencepiece.bpe.model",
+			},
+			RequiredFiles: []string{
+				"model.bin", "config.json", "sentencepiece.bpe.model",
+			},
+		},
 	}
 }

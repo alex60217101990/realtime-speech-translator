@@ -6,11 +6,21 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 )
 
-// drawHeader paints the title strip across the top of the Main tab.
-// status is passed in (not read off a.status) so the Draw goroutine
-// works on the same snapshot the rest of the frame uses — avoids a
-// race against SetStatus from the binding goroutine.
+// drawHeader paints the title strip across the top of the window.
+// Layout: tabs on the left, title centred, status pill on the
+// right. status is passed in (not read off a.status) so the Draw
+// goroutine works on the same snapshot the rest of the frame uses
+// — avoids a race against SetStatus from the binding goroutine.
 func (a *App) drawHeader(dst *ebiten.Image, r image.Rectangle, status SessionStatus) {
+	const tabsH = 32
+	tabsRect := image.Rect(
+		r.Min.X+SpaceL,
+		r.Min.Y+(r.Dy()-tabsH)/2,
+		r.Min.X+SpaceL+460,
+		r.Min.Y+(r.Dy()-tabsH)/2+tabsH,
+	)
+	a.drawTabs(dst, tabsRect)
+
 	const title = "Realtime Speech Translator"
 	tw, th := measureText(title, a.fonts.Title)
 	x := r.Min.X + (r.Dx()-int(tw))/2

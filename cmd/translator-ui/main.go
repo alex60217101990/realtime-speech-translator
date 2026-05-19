@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,16 +48,31 @@ func main() {
 
 	app := uiebt.NewApp()
 	applyLanguagesToApp(app, cfg)
+	app.AttachLogSink(loggingLogSink{})
 
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Wire the Models tab. The catalog is static, but installed
+	// state is filesystem-derived so we snapshot it now + refresh
+	// after every successful install via SetModelInstalled.
+	catalog := newCatalogAdapter(app)
+	app.SetCatalog(catalog.toUIEntries(), catalog.installedSnapshot(), catalog, ctx)
+
+	// Shared handle the mic-button + bringUpSession both poke at.
+	// bringUpSession fills sess.Session once the heavy load is done;
+	// before that, mic clicks no-op (button still toggles visually).
+	sess := &sessionHandle{}
+	app.SetMicHandler(func(on bool) {
+		sess.SetActive(on)
+	})
+
 	// Try to bring up the session in the background so the UI
 	// boots immediately. If models are missing we leave the
 	// header on "Waiting for models" and the user can still see
 	// the chrome / idle sphere.
-	go bringUpSession(ctx, app, cfg)
+	go bringUpSession(ctx, app, cfg, sess)
 
 	if err := uiebt.RunApp(ctx, app); err != nil {
 		slog.Error("ui exited with error", "err", err)
@@ -73,10 +89,47 @@ func applyLanguagesToApp(app *uiebt.App, cfg config.Settings) {
 	app.SetLanguages(src, prettyLang(src), tgt, prettyLang(tgt))
 }
 
+// sessionHandle is the shared box that both bringUpSession (fills
+// it once the Session is built) and the mic-button click handler
+// (calls Pause/Resume on it) point at. Indirection lets the click
+// handler exist before the heavy session-build goroutine finishes.
+type sessionHandle struct {
+	mu      sync.Mutex
+	session *rstapp.Session
+}
+
+func (h *sessionHandle) set(s *rstapp.Session) {
+	h.mu.Lock()
+	h.session = s
+	h.mu.Unlock()
+}
+
+// SetActive starts or pauses mic capture based on the toggle. No-op
+// when the session is not yet built (early click before models
+// finish loading) — the mic button still flips visually so the user
+// sees the click registered.
+func (h *sessionHandle) SetActive(on bool) {
+	h.mu.Lock()
+	s := h.session
+	h.mu.Unlock()
+	if s == nil {
+		return
+	}
+	var err error
+	if on {
+		err = s.Resume()
+	} else {
+		err = s.Pause()
+	}
+	if err != nil {
+		slog.Warn("mic toggle failed", "on", on, "err", err)
+	}
+}
+
 // bringUpSession runs the heavy work (model load, MT init, capture
 // device open) off the UI thread. The Ebiten loop owns the window
 // and would otherwise stall during the multi-second sherpa init.
-func bringUpSession(ctx context.Context, app *uiebt.App, cfg config.Settings) {
+func bringUpSession(ctx context.Context, app *uiebt.App, cfg config.Settings, sess *sessionHandle) {
 	app.SetStatus(uiebt.StatusWaiting)
 
 	// Build session.
@@ -101,7 +154,9 @@ func bringUpSession(ctx context.Context, app *uiebt.App, cfg config.Settings) {
 		_ = res.Session.Close()
 		return
 	}
+	sess.set(res.Session)
 	app.SetStatus(uiebt.StatusRunning)
+	app.SetRecording(true) // session auto-started capture
 
 	// Drain the three streams in dedicated goroutines so neither
 	// the events feed nor the audio feed can starve the other.

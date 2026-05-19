@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
@@ -64,6 +65,54 @@ type App struct {
 	sourceCode  string // "ru"
 	targetCode  string // "en"
 	hint        string // bottom-bar microcopy
+
+	// currentTab drives top-level view switching. Mutated only
+	// through setTab so the change happens under a.mu.
+	currentTab Tab
+
+	// logOpen toggles the terminal-style overlay anchored to the
+	// bottom of the window. Flipped by the bottom-bar Logs button.
+	logOpen bool
+
+	// logScroll is the wheel-driven offset into the log buffer
+	// measured in *lines from the bottom*. 0 == newest, positive
+	// scrolls back into history. Clamped in drawLogOverlay against
+	// the visible-line count.
+	logScroll int
+
+	// recording drives the mic button visual + actual session
+	// pause/resume. Flipped by the bottom-bar mic click. Starts at
+	// true because the cmd layer auto-starts the session on boot.
+	recording bool
+
+	// micHandler is invoked (with the new desired state) every
+	// time the user clicks the mic button. The cmd layer wires
+	// this to Session.Pause/Resume so the UI toggle actually
+	// controls capture — without it the button is purely visual.
+	micHandler func(on bool)
+
+	// logRect holds the last drawn log-overlay rectangle so the
+	// wheel handler in Update can decide whether the cursor is
+	// over it. Updated every Draw when logOpen is true.
+	logRect image.Rectangle
+
+	// hits is the per-frame click target list. Rebuilt every Draw,
+	// consumed by the next Update. See tabs.go for the
+	// register/dispatch helpers.
+	hits []hitRect
+
+	// catalog + installer state for the Models tab. Populated when
+	// the cmd layer calls SetCatalog. Kept here (not in a separate
+	// store) so Draw/Update have lock-free access via copy.
+	catalog          []ModelEntry
+	modelInstalled   map[string]bool
+	modelProgress    map[string]ModelProgressSnapshot
+	modelInstaller   ModelInstaller
+	installerContext context.Context
+
+	// log sink for the in-window terminal pane. Lazily populated by
+	// AttachLogSink so apps that do not wire it stay log-free.
+	logSink LogSink
 
 	// quit is flipped by RequestQuit (Ctrl+C / signal). The Update
 	// loop checks it on every tick and returns ebiten.Termination,
@@ -155,7 +204,43 @@ func (a *App) Update() error {
 		t := a.sphereTime()
 		a.sphere.setAudioInternal(idleAudio(t))
 	}
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		x, y := ebiten.CursorPosition()
+		a.dispatchClick(x, y)
+	}
+	if _, wy := ebiten.Wheel(); wy != 0 {
+		cx, cy := ebiten.CursorPosition()
+		a.handleWheel(cx, cy, wy)
+	}
 	return nil
+}
+
+// handleWheel routes mouse-wheel events to the widget under the
+// cursor. Currently only the log overlay consumes them; other
+// scrollable widgets can register the same way.
+func (a *App) handleWheel(cx, cy int, wy float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.logOpen {
+		return
+	}
+	r := a.logRect
+	if cx < r.Min.X || cx >= r.Max.X || cy < r.Min.Y || cy >= r.Max.Y {
+		return
+	}
+	// Positive wheel-y = scroll up (further into history).
+	step := int(wy)
+	if step == 0 {
+		if wy > 0 {
+			step = 1
+		} else {
+			step = -1
+		}
+	}
+	a.logScroll += step
+	if a.logScroll < 0 {
+		a.logScroll = 0
+	}
 }
 
 // RequestQuit signals the Update loop to exit the Ebiten game on
@@ -168,8 +253,6 @@ func (a *App) RequestQuit() {
 // always visibly alive — useful before the audio bindings land
 // and during long pauses between user utterances.
 func idleAudio(t float64) SphereAudio {
-	// Three sine waves at different frequencies keep the
-	// modulation from looking metronomic.
 	bass := 0.18 + 0.12*sin01(t*0.6)
 	mid := 0.10 + 0.10*sin01(t*0.45+1.2)
 	treble := 0.08 + 0.07*sin01(t*1.1+2.7)
@@ -216,21 +299,40 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.ensureBackground(bounds.Dx(), bounds.Dy())
 	screen.DrawImage(a.bg.image, nil)
 
+	a.resetHits()
+
 	a.mu.RLock()
 	transcript := append([]Card(nil), a.transcript...)
 	translation := append([]Card(nil), a.translation...)
 	srcCode, srcLabel := a.sourceCode, a.sourceLang
 	tgtCode, tgtLabel := a.targetCode, a.targetLang
 	status := a.status
+	tab := a.currentTab
+	logOpen := a.logOpen
 	a.mu.RUnlock()
 
 	r := LayoutFor(bounds.Dx(), bounds.Dy())
 	a.drawHeader(screen, r.Header, status)
-	a.drawPane(screen, r.Left, PaneHeader{Flag: srcCode, Label: srcLabel}, transcript)
-	a.drawPane(screen, r.Right, PaneHeader{Flag: tgtCode, Label: tgtLabel}, translation)
-	a.drawCenter(screen, r.Center)
+
+	switch tab {
+	case TabMain:
+		a.drawPane(screen, r.Left, PaneHeader{Flag: srcCode, Label: srcLabel}, transcript)
+		a.drawPane(screen, r.Right, PaneHeader{Flag: tgtCode, Label: tgtLabel}, translation)
+		a.drawCenter(screen, r.Center)
+	case TabModels:
+		body := image.Rect(r.Left.Min.X, r.Left.Min.Y, r.Right.Max.X, r.Left.Max.Y)
+		a.drawModelsPane(screen, body)
+	case TabSettings:
+		body := image.Rect(r.Left.Min.X, r.Left.Min.Y, r.Right.Max.X, r.Left.Max.Y)
+		a.drawSettingsPane(screen, body)
+	}
+
 	a.drawBottom(screen, r.Bottom)
 	a.drawStatus(screen, r.Status)
+
+	if logOpen {
+		a.drawLogOverlay(screen, r.Bottom)
+	}
 }
 
 // Layout reports the logical-pixel dimensions Ebiten should render
@@ -332,46 +434,136 @@ func (a *App) drawCenter(dst *ebiten.Image, r image.Rectangle) {
 // on the right. Wired to actions in a follow-up.
 func (a *App) drawBottom(dst *ebiten.Image, r image.Rectangle) {
 	cy := float32(r.Min.Y + r.Dy()/2)
-
-	// Centre stack: small "audio levels" + big mic + small "translate"
 	micR := float32(34)
 	cx := float32(r.Min.X + r.Dx()/2)
-	// Big mic button.
-	drawFilledCircle(dst, cx, cy, micR*1.35,
-		color.NRGBA{R: 0x4C, G: 0x76, B: 0xFF, A: 0x22})
-	drawFilledCircle(dst, cx, cy, micR, a.theme.AccentBlue)
-	drawCircleBorder(dst, cx, cy, micR, 2, a.theme.AccentCyan)
-	// Side mini buttons.
-	sideR := float32(22)
-	drawFilledCircle(dst, cx-90, cy, sideR, a.theme.Card)
-	drawCircleBorder(dst, cx-90, cy, sideR, 1, a.theme.CardBorder)
-	drawFilledCircle(dst, cx+90, cy, sideR, a.theme.Card)
-	drawCircleBorder(dst, cx+90, cy, sideR, 1, a.theme.CardBorder)
+	t := float32(a.sphereTime())
 
-	// Hint text under the mic.
-	hw, _ := measureText(a.hint, a.fonts.Caption)
-	drawText(dst, a.hint, a.fonts.Caption,
-		int(cx)-int(hw)/2, r.Max.Y-SpaceL, a.theme.TextMuted)
+	a.drawMicButton(dst, cx, cy, micR, t)
 
-	// Left side: mic / speaker icons (placeholder dots + labels).
-	leftX := r.Min.X + SpaceXL*2
-	drawFilledCircle(dst, float32(leftX), cy, sideR*0.7, a.theme.Card)
-	drawCircleBorder(dst, float32(leftX), cy, sideR*0.7, 1, a.theme.CardBorder)
-	drawText(dst, "Микрофон", a.fonts.Caption, leftX-30, int(cy)+38, a.theme.TextMuted)
+	// Hint text centred under the mic.
+	drawTextCentered(dst, a.hint, a.fonts.Caption,
+		int(cx), r.Max.Y-SpaceL, a.theme.TextMuted)
 
-	drawFilledCircle(dst, float32(leftX)+70, cy, sideR*0.7, a.theme.Card)
-	drawCircleBorder(dst, float32(leftX)+70, cy, sideR*0.7, 1, a.theme.CardBorder)
-	drawText(dst, "Динамик", a.fonts.Caption, leftX+40, int(cy)+38, a.theme.TextMuted)
+	// Logs toggle to the right of the mic. The other placeholder
+	// circles (Микрофон/Динамик/Текст/Настройки) were removed —
+	// the tab bar already covers Settings, and per-source mic
+	// device routing will come back as a proper dropdown.
+	logBtnR := float32(22) * 0.9
+	a.drawLogsButton(dst, cx+micR*2.3, cy, logBtnR)
+}
 
-	// Right side: text / settings icons.
-	rightX := r.Max.X - SpaceXL*2
-	drawFilledCircle(dst, float32(rightX)-70, cy, sideR*0.7, a.theme.Card)
-	drawCircleBorder(dst, float32(rightX)-70, cy, sideR*0.7, 1, a.theme.CardBorder)
-	drawText(dst, "Текст", a.fonts.Caption, rightX-90, int(cy)+38, a.theme.TextMuted)
+// drawMicButton paints the big start / stop button at the bottom
+// of the Main tab. State drives colour + glyph:
+//
+//   - idle (not recording): cyan-ringed blue circle, mic glyph
+//   - recording: red circle, white stop square, pulsing red halo
+//
+// Click toggles a.recording; future work wires this to actual
+// session start/stop. For now the button is purely visual feedback
+// so the user can tell the click landed.
+func (a *App) drawMicButton(dst *ebiten.Image, cx, cy, micR, time float32) {
+	a.mu.RLock()
+	rec := a.recording
+	a.mu.RUnlock()
 
-	drawFilledCircle(dst, float32(rightX), cy, sideR*0.7, a.theme.Card)
-	drawCircleBorder(dst, float32(rightX), cy, sideR*0.7, 1, a.theme.CardBorder)
-	drawText(dst, "Настройки", a.fonts.Caption, rightX-26, int(cy)+38, a.theme.TextMuted)
+	if rec {
+		// Pulsing red halo — radius oscillates 1.25× → 1.55× at
+		// ~1.4 Hz so motion reads as "live recording".
+		pulse := 1.4 + 0.15*float32(math.Sin(float64(time)*8.8))
+		drawFilledCircle(dst, cx, cy, micR*pulse,
+			color.NRGBA{R: 0xEF, G: 0x65, B: 0x6A, A: 0x30})
+		drawFilledCircle(dst, cx, cy, micR*1.18,
+			color.NRGBA{R: 0xEF, G: 0x65, B: 0x6A, A: 0x55})
+		drawFilledCircle(dst, cx, cy, micR, a.theme.AccentRed)
+		drawCircleBorder(dst, cx, cy, micR, 2,
+			color.NRGBA{R: 0xFF, G: 0xAE, B: 0xAE, A: 0xFF})
+		// Stop square (white).
+		sq := micR * 0.42
+		sqRect := image.Rect(
+			int(cx-sq/2), int(cy-sq/2),
+			int(cx+sq/2), int(cy+sq/2))
+		drawRoundRect(dst, sqRect, 4,
+			color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF})
+	} else {
+		// Idle: blue with cyan ring + white mic glyph + soft glow.
+		glow := 1.30 + 0.05*float32(math.Sin(float64(time)*1.4))
+		drawFilledCircle(dst, cx, cy, micR*glow,
+			color.NRGBA{R: 0x4C, G: 0x76, B: 0xFF, A: 0x22})
+		drawFilledCircle(dst, cx, cy, micR, a.theme.AccentBlue)
+		drawCircleBorder(dst, cx, cy, micR, 2, a.theme.AccentCyan)
+		drawMicGlyph(dst, cx, cy, micR*0.55,
+			color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF})
+	}
+
+	hit := image.Rect(int(cx-micR), int(cy-micR),
+		int(cx+micR), int(cy+micR))
+	a.registerHit(hit, a.ToggleRecording)
+}
+
+// ToggleRecording flips the recording flag, rotates the hint
+// microcopy, and fires the cmd-layer mic handler so the actual
+// capture device starts / stops in sync with the visual.
+func (a *App) ToggleRecording() {
+	a.mu.Lock()
+	a.recording = !a.recording
+	state := a.recording
+	if a.recording {
+		a.hint = "Запись идёт — нажмите чтобы остановить"
+	} else {
+		a.hint = "Нажмите чтобы начать запись"
+	}
+	h := a.micHandler
+	a.mu.Unlock()
+	if h != nil {
+		h(state)
+	}
+}
+
+// SetMicHandler registers the cmd-layer callback wired to mic
+// click events. Pass nil to detach.
+func (a *App) SetMicHandler(h func(on bool)) {
+	a.mu.Lock()
+	a.micHandler = h
+	a.mu.Unlock()
+}
+
+// SetRecording lets the cmd layer publish the actual capture
+// state back to the UI (e.g. when the session auto-starts on
+// boot, or after a Resume that we didn't trigger from the click).
+func (a *App) SetRecording(on bool) {
+	a.mu.Lock()
+	a.recording = on
+	if on {
+		a.hint = "Запись идёт — нажмите чтобы остановить"
+	} else {
+		a.hint = "Нажмите чтобы начать запись"
+	}
+	a.mu.Unlock()
+}
+
+// drawLogsButton paints the bottom-bar toggle that opens / closes
+// the terminal log overlay. Highlighted while the overlay is open.
+func (a *App) drawLogsButton(dst *ebiten.Image, cx, cy, r float32) {
+	a.mu.RLock()
+	open := a.logOpen
+	a.mu.RUnlock()
+	fill := a.theme.Card
+	border := a.theme.CardBorder
+	if open {
+		fill = a.theme.AccentBlue
+		border = a.theme.AccentCyan
+	}
+	drawFilledCircle(dst, cx, cy, r, fill)
+	drawCircleBorder(dst, cx, cy, r, 1, border)
+	// ">_" glyph using the caption font.
+	glyph := ">_"
+	gw, _ := measureText(glyph, a.fonts.Caption)
+	drawText(dst, glyph, a.fonts.Caption,
+		int(cx)-int(gw)/2, int(cy)+5, a.theme.TextPrimary)
+	drawText(dst, "Логи", a.fonts.Caption,
+		int(cx)-12, int(cy)+38, a.theme.TextMuted)
+	hit := image.Rect(int(cx-r), int(cy-r), int(cx+r), int(cy+r))
+	a.registerHit(hit, a.ToggleLog)
 }
 
 // drawStatus paints the bottom-most strip (mock shows quality

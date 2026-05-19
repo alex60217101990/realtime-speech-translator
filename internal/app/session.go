@@ -770,6 +770,31 @@ func (s *Session) emit(ctx context.Context, ev Event) {
 
 // Stop halts the audio devices and stage goroutines, then drains
 // the events channel. Idempotent.
+// Pause halts mic capture without tearing down the session, so a
+// subsequent Resume can restart in milliseconds. Use this for the
+// UI's mic-button toggle — Stop closes channels and cannot be
+// undone without rebuilding the Session from scratch.
+func (s *Session) Pause() error {
+	if s.cap == nil {
+		return nil
+	}
+	return s.cap.Stop()
+}
+
+// Resume restarts mic capture after Pause. Safe to call when the
+// session is already capturing — the underlying Capture.Start is
+// idempotent.
+func (s *Session) Resume() error {
+	if s.cap == nil {
+		return nil
+	}
+	if err := s.cap.Start(); err != nil &&
+		err.Error() != "capture: already started" {
+		return err
+	}
+	return nil
+}
+
 func (s *Session) Stop() error {
 	if !s.running.CompareAndSwap(true, false) {
 		return nil

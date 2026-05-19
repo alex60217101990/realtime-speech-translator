@@ -61,3 +61,16 @@ func drawText(dst *ebiten.Image, s string, face text.Face, x, y int, c color.NRG
 func measureText(s string, face text.Face) (w, h float64) {
 	return text.Measure(s, face, 1.4)
 }
+
+// drawTextCentered paints s centred at (cx, cy) — useful for pill
+// / button labels where computing the baseline by hand drifts. Uses
+// ebiten's built-in alignment options so the glyph layer takes
+// care of the math.
+func drawTextCentered(dst *ebiten.Image, s string, face text.Face, cx, cy int, c color.NRGBA) {
+	op := &text.DrawOptions{}
+	op.GeoM.Translate(float64(cx), float64(cy))
+	op.LayoutOptions.PrimaryAlign = text.AlignCenter
+	op.LayoutOptions.SecondaryAlign = text.AlignCenter
+	op.ColorScale.ScaleWithColor(c)
+	text.Draw(dst, s, face, op)
+}
