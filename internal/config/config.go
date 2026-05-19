@@ -72,7 +72,7 @@ func Default() Settings {
 		// model for the configured SourceLang. Users can override
 		// in Settings to lock to a specific model name.
 		STTModel:     "auto",
-		MTBackend:    "small100",
+		MTBackend:    "m2m100",
 		TTSVoice:     "piper-en-amy-low",
 		Threads:      0,
 		VADThreshold: 0.5,
@@ -119,17 +119,15 @@ func Load() (Settings, error) {
 
 // normalise rewrites legacy MT backend names from the previous
 // architecture so a config.yaml carried over from an older binary
-// does not log "backend unavailable" on every launch.
-//
-//	madlad / m2m100 → small100 (closest realtime tier in the new
-//	                            architecture; user can flip via UI)
-//	"" or unknown   → small100 (preserves Default's behaviour)
+// does not log "backend unavailable" on every launch. Unknown
+// values fall back to Default's m2m100 since that's the only MT
+// we currently ship as a downloadable release asset.
 func normalise(s *Settings) {
 	switch s.MTBackend {
-	case "small100", "opusmt", "off":
+	case "m2m100", "small100", "opusmt", "off":
 		// already valid
 	default:
-		s.MTBackend = "small100"
+		s.MTBackend = "m2m100"
 	}
 }
 

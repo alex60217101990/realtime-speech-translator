@@ -77,6 +77,9 @@ func httpGet(ctx context.Context, url string) (*http.Response, error) {
 	}
 	if resp.StatusCode/100 != 2 {
 		resp.Body.Close()
+		if resp.StatusCode == 404 {
+			return nil, fmt.Errorf("404: ассет не построен — задиспатчь workflow build-models.yml для этой модели")
+		}
 		return nil, fmt.Errorf("models: http %d for %s", resp.StatusCode, url)
 	}
 	return resp, nil

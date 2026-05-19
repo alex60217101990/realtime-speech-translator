@@ -60,19 +60,21 @@ func main() {
 	catalog := newCatalogAdapter(app)
 	app.SetCatalog(catalog.toUIEntries(), catalog.installedSnapshot(), catalog, ctx)
 
-	// Shared handle the mic-button + bringUpSession both poke at.
-	// bringUpSession fills sess.Session once the heavy load is done;
-	// before that, mic clicks no-op (button still toggles visually).
-	sess := &sessionHandle{}
+	// Shared handle the mic-button + reload loop both poke at.
+	// reload chan triggers the session-rebuild loop after Settings
+	// save so MT/TTS/STT/lang switches actually take effect.
+	sess := &sessionHandle{reload: make(chan struct{}, 1)}
 	app.SetMicHandler(func(on bool) {
 		sess.SetActive(on)
 	})
 
-	// Try to bring up the session in the background so the UI
-	// boots immediately. If models are missing we leave the
-	// header on "Waiting for models" and the user can still see
-	// the chrome / idle sphere.
-	go bringUpSession(ctx, app, cfg, sess)
+	// Settings: Save persists config + signals reload. The session
+	// loop reloads from disk so the next cycle picks up the change.
+	app.SetSettings(settingsSnapshotFromCfg(cfg), buildSettingsSaver(cfg, sess))
+
+	// Session loop in background — boots immediately, rebuilds on
+	// every reload signal until ctx is cancelled.
+	go runSessionLoop(ctx, app, sess)
 
 	if err := uiebt.RunApp(ctx, app); err != nil {
 		slog.Error("ui exited with error", "err", err)
@@ -89,19 +91,31 @@ func applyLanguagesToApp(app *uiebt.App, cfg config.Settings) {
 	app.SetLanguages(src, prettyLang(src), tgt, prettyLang(tgt))
 }
 
-// sessionHandle is the shared box that both bringUpSession (fills
-// it once the Session is built) and the mic-button click handler
-// (calls Pause/Resume on it) point at. Indirection lets the click
-// handler exist before the heavy session-build goroutine finishes.
+// sessionHandle is the shared box that the mic-button click
+// handler + Settings-save handler + the session loop all poke at.
+// session  — currently-running Session (nil before first build).
+// reload   — buffered chan, send on it to ask the loop to tear
+//            down the current Session and rebuild from the latest
+//            on-disk config.
 type sessionHandle struct {
 	mu      sync.Mutex
 	session *rstapp.Session
+	reload  chan struct{}
 }
 
 func (h *sessionHandle) set(s *rstapp.Session) {
 	h.mu.Lock()
 	h.session = s
 	h.mu.Unlock()
+}
+
+// Reload signals the session loop to rebuild on the next cycle.
+// Non-blocking: a pending reload is coalesced with this one.
+func (h *sessionHandle) Reload() {
+	select {
+	case h.reload <- struct{}{}:
+	default:
+	}
 }
 
 // SetActive starts or pauses mic capture based on the toggle. No-op
@@ -126,45 +140,94 @@ func (h *sessionHandle) SetActive(on bool) {
 	}
 }
 
-// bringUpSession runs the heavy work (model load, MT init, capture
-// device open) off the UI thread. The Ebiten loop owns the window
-// and would otherwise stall during the multi-second sherpa init.
-func bringUpSession(ctx context.Context, app *uiebt.App, cfg config.Settings, sess *sessionHandle) {
+// runSessionLoop boots the session, then waits for either the
+// outer context to be cancelled (program exit) or a reload signal
+// (Settings save). On reload it tears the current Session down,
+// re-loads the config from disk, and rebuilds. Audio/event pumps
+// are scoped per-cycle so they exit cleanly.
+func runSessionLoop(ctx context.Context, app *uiebt.App, sess *sessionHandle) {
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Warn("session loop: initial config load failed", "err", err)
+		cfg = config.Default()
+	}
+	for {
+		applyLanguagesToApp(app, cfg)
+		cycleCtx, cancelCycle := context.WithCancel(ctx)
+		res := startSessionCycle(cycleCtx, app, cfg, sess)
+		if res == nil {
+			cancelCycle()
+			// Build failed — wait for ctx.Done OR a reload (user
+			// might Save new settings that fix the issue).
+			select {
+			case <-ctx.Done():
+				return
+			case <-sess.reload:
+				newCfg, _ := config.Load()
+				cfg = newCfg
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			cancelCycle()
+			closeCycle(res)
+			return
+		case <-sess.reload:
+			slog.Info("session loop: reloading from config")
+			app.SetStatus(uiebt.StatusWaiting)
+			sess.set(nil)
+			cancelCycle()
+			closeCycle(res)
+			newCfg, _ := config.Load()
+			cfg = newCfg
+		}
+	}
+}
+
+// startSessionCycle builds the session + spins up the audio/event
+// pumps. Returns the live Result, or nil on a hard failure (caller
+// is expected to surface that to the UI and stall).
+func startSessionCycle(ctx context.Context, app *uiebt.App, cfg config.Settings, sess *sessionHandle) *sessionbuild.Result {
 	app.SetStatus(uiebt.StatusWaiting)
 
-	// Build session.
 	res, err := sessionbuild.Build(cfg)
 	if err != nil {
 		slog.Error("session build failed", "err", err)
 		app.SetStatus(uiebt.StatusError)
 		app.AppendTranslation("Не удалось загрузить модели — откройте Models tab.",
 			time.Now().Format("15:04"))
-		return
+		return nil
 	}
 	slog.Info("session built",
 		"stt_model", res.STTModel, "stt_kind", res.STTKind)
 
-	// Subscribe to the audio-bucket stream BEFORE Start so the
-	// capture wrapper sees a non-nil chan.
 	bucketsCh := res.Session.EnableAudioBuckets(60)
 
 	if err := res.Session.Start(ctx); err != nil {
 		slog.Error("session start failed", "err", err)
 		app.SetStatus(uiebt.StatusError)
 		_ = res.Session.Close()
-		return
+		return nil
 	}
 	sess.set(res.Session)
 	app.SetStatus(uiebt.StatusRunning)
-	app.SetRecording(true) // session auto-started capture
+	app.SetRecording(true)
 
-	// Drain the three streams in dedicated goroutines so neither
-	// the events feed nor the audio feed can starve the other.
+	effective := cfg
+	effective.MTBackend = res.MTBackend
+	effective.STTModel = res.STTModel
+	app.SetSettings(settingsSnapshotFromCfg(effective), buildSettingsSaver(effective, sess))
+
 	go pumpEvents(ctx, res, app, cfg)
 	go pumpAudio(ctx, bucketsCh, app)
+	return res
+}
 
-	<-ctx.Done()
-	slog.Info("shutting down session")
+func closeCycle(res *sessionbuild.Result) {
+	if res == nil {
+		return
+	}
 	_ = res.Session.Close()
 	if res.MTCache != nil {
 		_ = res.MTCache.Sync()
@@ -173,6 +236,13 @@ func bringUpSession(ctx context.Context, app *uiebt.App, cfg config.Settings, se
 
 // pumpAudio converts uihost.AudioBucket frames into the Sphere's
 // SphereAudio uniforms and pushes them to the App. ~60 Hz.
+//
+// Bass/Mid/Treble arrive pre-normalised by the spectrum analyser
+// (each tracks its own slow EWMA reference) so they sit in [0,1]
+// already. RMS is the raw chunk RMS — typical voice peaks at
+// ~0.10-0.20, so we boost it ×4 with a hard clamp to make the
+// shader's halo/dust uniforms swing through their full range
+// during normal-volume speech.
 func pumpAudio(ctx context.Context, ch <-chan uihost.AudioBucket, app *uiebt.App) {
 	for {
 		select {
@@ -182,11 +252,15 @@ func pumpAudio(ctx context.Context, ch <-chan uihost.AudioBucket, app *uiebt.App
 			if !ok {
 				return
 			}
+			rms := b.Rms * 4.0
+			if rms > 1 {
+				rms = 1
+			}
 			app.SetAudio(uiebt.SphereAudio{
 				Bass:   b.Bass,
 				Mid:    b.Mid,
 				Treble: b.Treble,
-				Rms:    b.Rms,
+				Rms:    rms,
 			})
 		}
 	}

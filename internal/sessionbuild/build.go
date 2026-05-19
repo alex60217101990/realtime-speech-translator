@@ -38,6 +38,12 @@ type Result struct {
 	NativeTTS *native.Engine // nil if sherpa Piper loaded successfully
 	STTModel  string         // resolved STT directory name
 	STTKind   string         // "transducer (streaming Zipformer)" etc.
+	// MTBackend is the effective backend actually loaded, which can
+	// differ from cfg.MTBackend when the requested model is missing
+	// (e.g. cfg says small100 but only m2m100 is on disk — the auto-
+	// resolver picks the latter). UI uses this to render the real
+	// state in Settings instead of the misleading config value.
+	MTBackend string
 }
 
 // Build resolves model paths from cfg, constructs the STT/MT/TTS
@@ -99,11 +105,12 @@ func Build(cfg config.Settings) (*Result, error) {
 		}
 	}
 
-	mtEngine, mtCache, err := buildMTWithCache(cfg)
+	mtEngine, mtCache, mtBackend, err := buildMTWithCache(cfg)
 	if err != nil {
 		slog.Warn("sessionbuild: mt unavailable; running passthrough", "err", err)
 		mtEngine = mt.Disabled{}
 		mtCache = nil
+		mtBackend = "off"
 	}
 	if mtCache != nil {
 		st := mtCache.Stats()
@@ -131,6 +138,7 @@ func Build(cfg config.Settings) (*Result, error) {
 		NativeTTS: nativeFallback,
 		STTModel:  resolvedSTT,
 		STTKind:   kindName,
+		MTBackend: mtBackend,
 	}, nil
 }
 

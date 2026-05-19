@@ -166,7 +166,7 @@ jobs:
                 m2m100-418m-int8)
                   convert_m2m100 m2m100-418m-int8 facebook/m2m100_418M ;;
                 small100-int8)
-                  convert_m2m100 small100-int8 alirezamshi/small100 ;;
+                  convert_m2m100 small100-int8 alirezamsh/small100 ;;
                 opusmt-ru-en)
                   convert_opusmt opusmt-ru-en Helsinki-NLP/opus-mt-ru-en ;;
                 opusmt-en-ru)

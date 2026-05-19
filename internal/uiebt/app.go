@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -114,6 +115,15 @@ type App struct {
 	// AttachLogSink so apps that do not wire it stay log-free.
 	logSink LogSink
 
+	// settings drives the Settings tab. The committed snapshot is
+	// what was last saved to disk; the draft accumulates user edits
+	// until Save fires.
+	settings      SettingsSnapshot
+	settingsDraft SettingsSnapshot
+	settingsSave  SettingsSaver
+	settingsDirty bool
+	settingsMsg   string
+
 	// quit is flipped by RequestQuit (Ctrl+C / signal). The Update
 	// loop checks it on every tick and returns ebiten.Termination,
 	// which is how Ebiten exits cleanly.
@@ -158,6 +168,7 @@ func (a *App) SetStatus(s SessionStatus) {
 
 // AppendTranscript pushes one finalised STT line to the left pane.
 func (a *App) AppendTranscript(text, ts string) {
+	text = sanitiseGlyphs(text)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.transcript = append(a.transcript, Card{Text: text, Timestamp: ts, Active: true})
@@ -168,12 +179,35 @@ func (a *App) AppendTranscript(text, ts string) {
 
 // AppendTranslation pushes one MT line to the right pane.
 func (a *App) AppendTranslation(text, ts string) {
+	text = sanitiseGlyphs(text)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.translation = append(a.translation, Card{Text: text, Timestamp: ts, Active: true})
 	if n := len(a.translation); n >= 2 {
 		a.translation[n-2].Active = false
 	}
+}
+
+// sanitiseGlyphs replaces Unicode punctuation that the embedded
+// goregular font does not have glyphs for. Without this MT output
+// containing smart quotes / em-dashes / ellipsis renders as the
+// tofu box "□" inside otherwise-fine text.
+func sanitiseGlyphs(s string) string {
+	if s == "" {
+		return s
+	}
+	r := s
+	r = strings.ReplaceAll(r,"‘", "'")  // ‘
+	r = strings.ReplaceAll(r,"’", "'")  // ’
+	r = strings.ReplaceAll(r,"‚", "'")  // ‚
+	r = strings.ReplaceAll(r,"“", "\"") // “
+	r = strings.ReplaceAll(r,"”", "\"") // ”
+	r = strings.ReplaceAll(r,"„", "\"") // „
+	r = strings.ReplaceAll(r,"–", "-")  // –
+	r = strings.ReplaceAll(r,"—", "--") // —
+	r = strings.ReplaceAll(r,"…", "...") // …
+	r = strings.ReplaceAll(r," ", " ")  // NBSP
+	return r
 }
 
 // SetLanguages updates the pane headers + flag colours.
@@ -503,6 +537,10 @@ func (a *App) drawMicButton(dst *ebiten.Image, cx, cy, micR, time float32) {
 // ToggleRecording flips the recording flag, rotates the hint
 // microcopy, and fires the cmd-layer mic handler so the actual
 // capture device starts / stops in sync with the visual.
+//
+// When stopping, also resets the sphere's external-audio flag so
+// the idle wave reclaims control and the halo breathes back down
+// — otherwise the last loud RMS value sticks forever via the EMA.
 func (a *App) ToggleRecording() {
 	a.mu.Lock()
 	a.recording = !a.recording
@@ -514,6 +552,9 @@ func (a *App) ToggleRecording() {
 	}
 	h := a.micHandler
 	a.mu.Unlock()
+	if !state {
+		a.sphere.ResetExternal()
+	}
 	if h != nil {
 		h(state)
 	}

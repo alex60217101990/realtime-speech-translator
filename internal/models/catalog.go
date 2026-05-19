@@ -214,16 +214,17 @@ func DefaultCatalog() []Entry {
 			},
 		},
 		{
-			// SMaLL-100 is a distilled M2M-100 (~330 MB int8). The MT
-			// loader (internal/mt/small100.go) supports it, but we
-			// don't yet host a CT2-exported tarball — the UI shows
-			// this entry as "URL TBD" so the user can see the
-			// backend is wired and ready for a future release.
+			// SMaLL-100 is a distilled M2M-100 (~315 MB int8). The MT
+			// loader (internal/mt/small100.go) consumes it. The
+			// asset is produced by .github/workflows/build-models.yml
+			// when dispatched with models="small100-int8"; until
+			// that workflow is run for the active release tag the
+			// download will 404 and Install surfaces the error.
 			Kind:        KindMT,
 			Name:        "small100-int8",
 			DisplayName: "SMaLL-100 int8 (distilled M2M-100, CT2)",
 			License:     "MIT (Microsoft SMaLL-100)",
-			URL:         "",
+			URL:         "https://github.com/alex60217101990/realtime-speech-translator/releases/download/models-v1/small100-int8.tar.gz",
 			SizeBytes:   330_000_000,
 			Tarball:     true,
 			BackendName: "small100",

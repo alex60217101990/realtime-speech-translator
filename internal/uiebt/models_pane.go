@@ -148,7 +148,7 @@ func (a *App) drawModelsPane(dst *ebiten.Image, r image.Rectangle) {
 	// Cards. Compact height so all 7 catalog entries fit a 800-px
 	// window with room left over.
 	cardY := tool.Max.Y + SpaceS
-	const cardH = 60
+	const cardH = 52
 	for _, e := range catalog {
 		if cardY+cardH > r.Max.Y {
 			break
@@ -178,15 +178,13 @@ func (a *App) drawModelCard(dst *ebiten.Image, r image.Rectangle,
 	}
 	drawFilledCircle(dst, dotX, dotY, 6, dotColor)
 
-	// Title + meta. Use vertical centering since cardH=60 leaves
-	// no room for baseline guesswork.
 	textX := r.Min.X + SpaceL + 28
 	drawText(dst, e.DisplayName, a.fonts.Body,
-		textX, r.Min.Y+10, a.theme.TextPrimary)
+		textX, r.Min.Y+6, a.theme.TextPrimary)
 	meta := fmt.Sprintf("%s · %s · %s",
 		e.Kind, humanBytes(e.SizeBytes), e.License)
 	drawText(dst, meta, a.fonts.Caption,
-		textX, r.Min.Y+34, a.theme.TextMuted)
+		textX, r.Min.Y+28, a.theme.TextMuted)
 
 	// Progress bar (only while running or after failure).
 	if p.Running || p.Error != "" {
@@ -355,16 +353,3 @@ func humanBytes(n int64) string {
 	}
 }
 
-// drawSettingsPane is the placeholder for Stage 5+1 — for now a
-// centred "coming soon" tile so the tab is visibly reachable.
-func (a *App) drawSettingsPane(dst *ebiten.Image, r image.Rectangle) {
-	tile := image.Rect(
-		r.Min.X+r.Dx()/4, r.Min.Y+r.Dy()/3,
-		r.Max.X-r.Dx()/4, r.Min.Y+r.Dy()/3+140)
-	drawRoundRect(dst, tile, RadiusCard, a.theme.Card)
-	drawRoundRectBorder(dst, tile, RadiusCard, 1, a.theme.CardBorder)
-	drawText(dst, "Настройки появятся в следующей итерации",
-		a.fonts.Body,
-		tile.Min.X+SpaceXL, tile.Min.Y+tile.Dy()/2+6,
-		a.theme.TextSecondary)
-}

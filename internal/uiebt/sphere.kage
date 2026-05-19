@@ -141,7 +141,7 @@ func particles(uv vec2, t float, bass float, mid float, treble float, rms float)
 			// scatters periodically even in silence.
 			scatAng := h5 * 6.2832
 			scatDir := vec2(cos(scatAng), sin(scatAng))
-			scatter := scatDir * (rms*1.6*sens + bass*0.9*sens + burst*0.55*sens) * 0.65
+			scatter := scatDir * (rms*3.4*sens + bass*1.8*sens + burst*0.55*sens) * 0.95
 
 			home := vec2(h1, h2)
 			off := home + wiggle + cohesion + scatter
@@ -192,9 +192,9 @@ func waveform(rn float, ang float, t float, bass float, mid float, treble float,
 	}
 	// Three angular harmonics at different frequencies. Each scrolls
 	// at its own rate so the trace never settles into a static shape.
-	w1 := sin(ang*3.0+t*0.55) * (0.04 + 0.32*bass)
-	w2 := sin(ang*7.0-t*0.85) * (0.03 + 0.22*mid)
-	w3 := sin(ang*15.0+t*1.30) * (0.02 + 0.18*treble)
+	w1 := sin(ang*3.0+t*0.55) * (0.04 + 0.70*bass)
+	w2 := sin(ang*7.0-t*0.85) * (0.03 + 0.48*mid)
+	w3 := sin(ang*15.0+t*1.30) * (0.02 + 0.38*treble)
 
 	// Soft floor so the ring is always visible.
 	base := 0.02 + 0.02*sin(ang*5.0+t*0.7)
@@ -235,9 +235,9 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 	uv := p / r
 
 	// Body masks — sphere outline plus the soft halo behind it.
-	displace := 0.03 * Bass
+	displace := 0.08 * Bass
 	core := 1.0 - smoothstep(0.985+displace, 1.02+displace, rn)
-	halo := 1.0 - smoothstep(1.0, 1.4+0.18*Rms, rn)
+	halo := 1.0 - smoothstep(1.0, 1.4+0.55*Rms, rn)
 	halo = halo * halo * 0.55
 
 	// Dark body fill — deep navy with a slight magenta tint near
@@ -269,7 +269,7 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 	innerFalloff := smoothstep(1.0, 0.5, rn)
 	dust := particles(uv, Time, Bass, Mid, Treble, Rms) * innerFalloff
 	dustCol := mix(vec3(0.55, 0.70, 1.00), vec3(0.90, 0.50, 1.00), cluster)
-	dust *= 1.4 + 0.9*Bass + 0.5*Rms
+	dust *= 1.4 + 1.8*Bass + 1.6*Rms
 
 	// Accent stars — a few bright key points.
 	acc := accentStars(uv, Time) * innerFalloff

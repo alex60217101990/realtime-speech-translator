@@ -5,9 +5,11 @@ import (
 	"image"
 	"log/slog"
 	"math"
+	"math/rand"
 	"sync"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
 //go:embed sphere.kage
@@ -36,6 +38,19 @@ type Sphere struct {
 	a              SphereAudio // EMA-smoothed value handed to shader
 	time           float64
 	externalDriven bool // flipped true by the first SetAudio call
+
+	// --- particle overlay state (sphere_overlay.go) ---
+	overlayNoise     *simplexNoise
+	overlayRNG       *rand.Rand
+	overlayParticles []overlayParticle
+	overlayPath      *vector.Path
+	overlayFader     *ebiten.Image // 1×1 white quad reused for fade pass
+	overlayAccum     *ebiten.Image
+	overlayW         int
+	overlayH         int
+	overlayCX        float64 // sphere centre in accum-local coords
+	overlayCY        float64
+	overlayR         float64
 }
 
 // audioSmoothTau is the time constant of the per-frame EMA that
@@ -91,6 +106,17 @@ func (s *Sphere) setAudioInternal(a SphereAudio) {
 	s.mu.Unlock()
 }
 
+// ResetExternal clears the "an audio bucket has arrived" flag so
+// the idle wave takes back over. Called when the user pauses
+// capture — without this the sphere would hold the last loud RMS
+// value forever and the halo would never breathe back down.
+func (s *Sphere) ResetExternal() {
+	s.mu.Lock()
+	s.externalDriven = false
+	s.target = SphereAudio{}
+	s.mu.Unlock()
+}
+
 // Draw paints the sphere into rect r on dst. The shader resolves
 // the sphere geometry per-pixel; we provide the centre + base
 // radius in pixel space + current audio uniforms.
@@ -127,4 +153,8 @@ func (s *Sphere) Draw(dst *ebiten.Image, r image.Rectangle) {
 	}
 	op.GeoM.Translate(float64(env.Min.X), float64(env.Min.Y))
 	dst.DrawRectShader(env.Dx(), env.Dy(), s.shader, op)
+
+	// Particle overlay drawn on top of the shader so the magnetic
+	// streams brighten the body without painting over the halo.
+	s.drawOverlay(dst, env, a, t)
 }
