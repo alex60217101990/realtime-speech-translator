@@ -75,7 +75,20 @@ func (a *App) drawSettingsPane(dst *ebiten.Image, r image.Rectangle) {
 			a.drawSegmented(dst, rect,
 				[]string{"ru", "en", "auto"},
 				draft.SourceLang,
-				func(v string) { a.mutateSettings(func(s *SettingsSnapshot) { s.SourceLang = v }) })
+				func(v string) {
+					a.mutateSettings(func(s *SettingsSnapshot) {
+						// Resetting STT to "auto" forces the
+						// resolver to re-pick the best model for
+						// the new source language — otherwise the
+						// previously chosen STT (e.g. nemo-russian)
+						// would stay loaded for English audio and
+						// recognition would silently fail.
+						if s.SourceLang != v {
+							s.STTModel = "auto"
+						}
+						s.SourceLang = v
+					})
+				})
 		}},
 		{"Язык-цель", func(rect image.Rectangle) {
 			a.drawSegmented(dst, rect,

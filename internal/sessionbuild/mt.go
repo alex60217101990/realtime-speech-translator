@@ -3,7 +3,6 @@ package sessionbuild
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -30,7 +29,7 @@ func buildMT(cfg config.Settings) (mt.Engine, string, error) {
 		return nil, "", err
 	}
 
-	backend := resolveMTBackend(cfg.MTBackend, sm, m2m, root)
+	backend := resolveMTBackend(cfg.MTBackend, sm, m2m, root, cfg.SourceLang, cfg.TargetLang)
 	if backend != cfg.MTBackend {
 		slog.Info("sessionbuild: mt backend auto-resolved",
 			"requested", cfg.MTBackend, "using", backend)
@@ -70,8 +69,13 @@ func buildMTWithCache(cfg config.Settings) (mt.Engine, *mt.Cached, string, error
 }
 
 // resolveMTBackend falls back to whatever MT model is actually
-// usable on disk when the requested backend has no files.
-func resolveMTBackend(requested, smDir, m2mDir, opusRoot string) string {
+// usable on disk when the requested backend has no files. For
+// opusmt the check is per-language-pair: a bare opusmt/ directory
+// (created opportunistically by paths.OPUSMTPair) does not count
+// — only an opusmt/<src>-<tgt>/model.bin file does. This keeps a
+// user that flipped to opusmt without installing the en-es pair
+// from getting "Unable to open file model.bin" on every translate.
+func resolveMTBackend(requested, smDir, m2mDir, opusRoot, srcLang, tgtLang string) string {
 	want := strings.ToLower(strings.TrimSpace(requested))
 	if want == "off" {
 		return "off"
@@ -83,13 +87,9 @@ func resolveMTBackend(requested, smDir, m2mDir, opusRoot string) string {
 		case "small100":
 			return fileExists(filepath.Join(smDir, "model.bin"))
 		case "opusmt":
-			entries, _ := os.ReadDir(opusRoot)
-			for _, e := range entries {
-				if e.IsDir() {
-					return true
-				}
-			}
-			return false
+			pair := strings.ToLower(strings.TrimSpace(srcLang)) +
+				"-" + strings.ToLower(strings.TrimSpace(tgtLang))
+			return fileExists(filepath.Join(opusRoot, pair, "model.bin"))
 		}
 		return false
 	}

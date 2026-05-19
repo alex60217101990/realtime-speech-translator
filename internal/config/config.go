@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -122,6 +123,12 @@ func Load() (Settings, error) {
 // does not log "backend unavailable" on every launch. Unknown
 // values fall back to Default's m2m100 since that's the only MT
 // we currently ship as a downloadable release asset.
+//
+// Also resets STTModel to "auto" when the persisted choice is
+// clearly mismatched with SourceLang (Russian model for English
+// source or vice-versa) — without this a user that switched
+// source lang via the old UI but never touched the STT field
+// would silently load the wrong STT and get no recognition.
 func normalise(s *Settings) {
 	switch s.MTBackend {
 	case "m2m100", "small100", "opusmt", "off":
@@ -129,6 +136,27 @@ func normalise(s *Settings) {
 	default:
 		s.MTBackend = "m2m100"
 	}
+	if mismatchedSTT(s.STTModel, s.SourceLang) {
+		s.STTModel = "auto"
+	}
+}
+
+// mismatchedSTT returns true when the chosen STT model's name
+// implies a different language than the requested source. Only
+// catches the two heuristics we care about today (russian / en)
+// — unknown model names pass through unchanged.
+func mismatchedSTT(model, src string) bool {
+	if model == "" || model == "auto" {
+		return false
+	}
+	m := strings.ToLower(model)
+	switch strings.ToLower(src) {
+	case "en":
+		return strings.Contains(m, "russian") || strings.Contains(m, "-ru")
+	case "ru":
+		return strings.Contains(m, "-en") || strings.Contains(m, "english")
+	}
+	return false
 }
 
 // Save writes the settings to config.yaml using atomic rename.

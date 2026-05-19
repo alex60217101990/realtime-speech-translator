@@ -14,7 +14,9 @@ func build(cfg FactoryConfig) (Engine, error) {
 	switch strings.ToLower(cfg.Backend) {
 	case "m2m100":
 		c := DefaultM2M100Config(cfg.M2M100ModelDir, cfg.M2M100SPModel)
-		c.Threads = cfg.Threads
+		if cfg.Threads > 0 {
+			c.Threads = cfg.Threads
+		}
 		e, err := NewM2M100(c)
 		if err != nil {
 			return nil, fmt.Errorf("mt: build m2m100: %w", err)
@@ -23,7 +25,9 @@ func build(cfg FactoryConfig) (Engine, error) {
 
 	case "small100":
 		c := DefaultSMaLL100Config(cfg.SMaLL100ModelDir, cfg.SMaLL100SPModel)
-		c.Threads = cfg.Threads
+		if cfg.Threads > 0 {
+			c.Threads = cfg.Threads
+		}
 		e, err := NewSMaLL100(c)
 		if err != nil {
 			return nil, fmt.Errorf("mt: build small100: %w", err)
@@ -32,7 +36,9 @@ func build(cfg FactoryConfig) (Engine, error) {
 
 	case "opusmt":
 		c := DefaultOPUSMTConfig(cfg.OPUSMTRoot)
-		c.Threads = cfg.Threads
+		if cfg.Threads > 0 {
+			c.Threads = cfg.Threads
+		}
 		e, err := NewOPUSMT(c)
 		if err != nil {
 			return nil, fmt.Errorf("mt: build opusmt: %w", err)

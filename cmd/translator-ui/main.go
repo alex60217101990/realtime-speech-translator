@@ -214,6 +214,12 @@ func startSessionCycle(ctx context.Context, app *uiebt.App, cfg config.Settings,
 	app.SetStatus(uiebt.StatusRunning)
 	app.SetRecording(true)
 
+	// MT warmup: ctranslate2 lazy-loads the model on first
+	// translate; without a warmup the user sees a 2-5s delay on
+	// their first utterance. Fire-and-forget a synthetic translate
+	// so the weights are in memory by the time real speech lands.
+	go warmupMT(ctx, res, cfg)
+
 	effective := cfg
 	effective.MTBackend = res.MTBackend
 	effective.STTModel = res.STTModel
@@ -222,6 +228,43 @@ func startSessionCycle(ctx context.Context, app *uiebt.App, cfg config.Settings,
 	go pumpEvents(ctx, res, app, cfg)
 	go pumpAudio(ctx, bucketsCh, app)
 	return res
+}
+
+// warmupMT triggers synthetic translates so ctranslate2 has the
+// model weights paged in (and the decoder graph compiled for the
+// specific language-pair direction) by the time the user's first
+// real utterance lands. Without this the first MT call routinely
+// takes 2-5 s while m2m100 lazy-loads its per-language token
+// embeddings. We warm both directions because the cache hit on
+// one does not pre-load the other and many users speak then
+// switch ru→en / en→ru mid-session.
+func warmupMT(ctx context.Context, res *sessionbuild.Result, cfg config.Settings) {
+	if res == nil || res.MTCache == nil {
+		return
+	}
+	src, tgt := cfg.SourceLang, cfg.TargetLang
+	if src == "" || src == "auto" {
+		src = "en"
+	}
+	if tgt == "" {
+		tgt = "en"
+	}
+	warm := func(s, t string) {
+		start := time.Now()
+		_, err := res.MTCache.Translate("Hello world.", s, t)
+		if err != nil {
+			slog.Debug("mt warmup failed", "err", err, "src", s, "tgt", t)
+			return
+		}
+		slog.Info("mt warmup done",
+			"ms", time.Since(start).Milliseconds(),
+			"src", s, "tgt", t)
+	}
+	warm(src, tgt)
+	if src != tgt {
+		warm(tgt, src)
+	}
+	_ = ctx
 }
 
 func closeCycle(res *sessionbuild.Result) {

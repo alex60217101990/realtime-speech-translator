@@ -170,11 +170,16 @@ type Session struct {
 	speakingFl  atomic.Bool
 }
 
-// Sentence-stitching tunables. Same values as perf/simd-mt-tuning.
+// Sentence-stitching tunables. stitchWindow dominates the
+// observed lag between Final and Translation when STT emits
+// without punctuation (e.g. zipformer-streaming-en): 700 ms felt
+// sluggish, 250 ms still batches realistic mid-utterance fragments
+// without stalling MT. NeMo Russian + punct lands `terminal=true`
+// on most Finals and bypasses the timer entirely either way.
 const (
-	stitchWindow         = 700 * time.Millisecond // wait this long for the next fragment
-	stitchMaxFragments   = 4                      // never stitch more than this many finals
-	stitchMaxFragmentSec = 4                      // a Final longer than this is flushed on its own
+	stitchWindow         = 250 * time.Millisecond
+	stitchMaxFragments   = 4
+	stitchMaxFragmentSec = 4
 )
 
 // Half-duplex tail (mute hold-down after the playback ring drains).
